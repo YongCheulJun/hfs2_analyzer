@@ -11777,7 +11777,24 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         # 같은 cond 그룹 내 ROI 비율 일관성 점검 — outlier 마킹
         consistency = check_roi_group_consistency(self.images)
 
-        for idx, img in enumerate(self.images):
+        # ROI 품질 우선순위 정렬 — 문제 있는 카드를 위로
+        # (self.images 자체는 변경 안 함; 표시 순서만 변경)
+        def _quality_priority(i):
+            img = self.images[i]
+            flag = img.get("roi_flag")
+            inconsistent, _ = consistency.get(i, (False, 1.0))
+            if flag == "failed":            return 0  # 시편 검출 실패 (수동 필수)
+            if flag == "warn_paper":        return 1  # 흰 배경 포함
+            if flag == "warn_small":        return 2  # 면적 작음
+            if flag == "warn_off":          return 3  # 가장자리 근접
+            if not img.get("roi"):          return 4  # ROI 미설정
+            if inconsistent:                return 5  # 그룹 불일치 (PURPLE)
+            return 9                                  # good / manual / db OK
+        display_order = sorted(range(len(self.images)),
+                               key=lambda i: (_quality_priority(i), i))
+
+        for idx in display_order:
+            img = self.images[idx]
             is_sel  = (idx == self.sel_idx)
             has_roi = img.get("roi") is not None
             done_a  = not np.isnan(img.get("s_mean", np.nan))
