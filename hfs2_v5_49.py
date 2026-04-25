@@ -442,14 +442,107 @@ def auto_detect_roi(rgb: np.ndarray,
         return default_roi, "failed", f"오류: {e}"
 
 
-def _border_color_for_roi(flag, has_roi: bool, defaults: dict) -> str:
-    """카드 테두리 색상. defaults = {'green':..,'amber':..,'red':..,'border':..}"""
-    if flag == "manual" or flag == "good":
-        return defaults["green"]
-    if flag in ("warn_small", "warn_off", "warn_paper"):
-        return defaults["amber"]
+def evaluate_roi_quality(rgb: np.ndarray, roi: tuple,
+                         paper_v_thresh: int = 215,
+                         paper_s_thresh: int = 25,
+                         min_area_ratio: float = 0.10,
+                         center_off_ratio: float = 0.20,
+                         paper_inside_ratio: float = 0.05) -> tuple:
+    """주어진 ROI 에 대해 품질만 평가 (자동 추정 X — DB 로드 등에 사용).
+    Returns (flag, reason) — flag ∈ good / warn_small / warn_off / warn_paper / failed
+    """
+    if rgb is None or roi is None:
+        return "failed", "이미지 또는 ROI 없음"
+    h, w = rgb.shape[:2]
+    x0, y0, x1, y1 = roi
+    if x1 <= x0 or y1 <= y0:
+        return "failed", "ROI 너비/높이 0"
+    img_area = h * w
+    img_cx, img_cy = w / 2, h / 2
+    roi_area = (x1 - x0) * (y1 - y0)
+    area_ratio = roi_area / img_area
+    if area_ratio < min_area_ratio:
+        return "warn_small", f"ROI 면적 작음 ({area_ratio*100:.0f}%)"
+    rcx = (x0 + x1) / 2
+    rcy = (y0 + y1) / 2
+    off = max(abs(rcx - img_cx) / w, abs(rcy - img_cy) / h)
+    if off > center_off_ratio:
+        return "warn_off", f"ROI 중심 편향 (Δ={off*100:.0f}%)"
+    try:
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        paper = (hsv[:, :, 2] > paper_v_thresh) & (hsv[:, :, 1] < paper_s_thresh)
+        sub = paper[y0:y1, x0:x1]
+        paper_in_roi = float(sub.mean()) if sub.size > 0 else 0.0
+        if paper_in_roi > paper_inside_ratio:
+            return "warn_paper", f"ROI 안 흰 배경 {paper_in_roi*100:.0f}% 포함"
+    except Exception as e:
+        return "failed", f"품질 평가 오류: {e}"
+    return "good", "정상"
+
+
+def _roi_to_ratio(roi: tuple, w: int, h: int) -> tuple:
+    return (roi[0] / w, roi[1] / h, roi[2] / w, roi[3] / h)
+
+
+def _ratio_iou(a: tuple, b: tuple) -> float:
+    """두 비율 ROI 의 IoU."""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0 = max(ax0, bx0); iy0 = max(ay0, by0)
+    ix1 = min(ax1, bx1); iy1 = min(ay1, by1)
+    iw = max(0.0, ix1 - ix0); ih = max(0.0, iy1 - iy0)
+    inter = iw * ih
+    aa = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+    bb = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+    uni = aa + bb - inter
+    return inter / uni if uni > 0 else 0.0
+
+
+def check_roi_group_consistency(images: list, iou_thresh: float = 0.70) -> dict:
+    """같은 cond 그룹 내 ROI 비율 일관성 점검.
+
+    각 그룹의 ROI 비율 중앙값과 IoU < iou_thresh 인 이미지를 outlier 로 마킹.
+    Returns dict {idx: (is_outlier: bool, group_iou: float)}
+    """
+    out = {}
+    # cond 별 그룹화
+    groups = {}
+    for i, img in enumerate(images):
+        cond = (img.get("cond") or "").strip()
+        if not cond or img.get("roi") is None or img.get("rgb") is None:
+            out[i] = (False, 1.0)
+            continue
+        groups.setdefault(cond, []).append(i)
+    for cond, idxs in groups.items():
+        if len(idxs) < 2:
+            for i in idxs:
+                out[i] = (False, 1.0)
+            continue
+        ratios = []
+        for i in idxs:
+            img = images[i]
+            h, w = img["rgb"].shape[:2]
+            ratios.append(_roi_to_ratio(img["roi"], w, h))
+        # 중앙값
+        med = tuple(float(np.median([r[k] for r in ratios])) for k in range(4))
+        for i, r in zip(idxs, ratios):
+            iou = _ratio_iou(r, med)
+            out[i] = (iou < iou_thresh, iou)
+    return out
+
+
+def _border_color_for_roi(flag, has_roi: bool, defaults: dict,
+                          inconsistent: bool = False) -> str:
+    """카드 테두리 색상. defaults = {'green':..,'amber':..,'red':..,'purple':..,'border':..}"""
+    # 우선순위: failed > warn > inconsistent > good > none
     if flag == "failed":
         return defaults["red"]
+    if flag in ("warn_small", "warn_off", "warn_paper"):
+        return defaults["amber"]
+    if inconsistent and has_roi:
+        return defaults["purple"]
+    if flag in ("manual", "good"):
+        return defaults["green"]
     return defaults["green"] if has_roi else defaults["border"]
 
 
@@ -1786,14 +1879,14 @@ class App(_Base):
         tk.Label(gf, text=_L("💡 사용법","💡 How to use"),
                  bg=CARD2, fg=ACCENT, font=MFB).pack(anchor="w", padx=8, pady=(5,1))
         tk.Label(gf,
-                 text=_L("1. 이미지 추가 → 자동 ROI 적용됨\n"
+                 text=_L("1. 이미지 추가 → 자동 ROI 적용 (DB 로드는 ROI 보존)\n"
                          "2. 카드 테두리 색으로 품질 확인:\n"
-                         "   🟢 녹색=OK  🟠 주황=검토필요  🔴 빨강=실패\n"
-                         "3. 주황·빨강만 🎯 눌러 수동 보정\n"
+                         "   🟢 녹색=OK  🟠 주황=검토  🟣 보라=조건 불일치  🔴 빨강=실패\n"
+                         "3. 주황·보라·빨강만 🎯 눌러 수동 보정\n"
                          "4. Run [▶ Analyze All]",
-                         "1. Add images → auto ROI applied\n"
+                         "1. Add images → auto ROI (DB load preserves ROI)\n"
                          "2. Card border = quality:\n"
-                         "   🟢 OK  🟠 review  🔴 failed\n"
+                         "   🟢 OK  🟠 review  🟣 group mismatch  🔴 failed\n"
                          "3. Fix flagged ones with 🎯\n"
                          "4. Run [▶ Analyze All]"),
                  bg=CARD2, fg=TXT, font=LF,
@@ -4542,6 +4635,16 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                             continue
                         rec["day_var"]  = tk.StringVar(value=rec["day"])
                         rec["cond_var"] = tk.StringVar(value=rec["cond"])
+                        # DB 의 ROI 는 그대로 보존 + 품질만 평가 (자동 추정 X)
+                        if rec.get("roi") is not None and rec.get("rgb") is not None:
+                            flg, why = evaluate_roi_quality(rec["rgb"], rec["roi"])
+                            rec["roi_flag"] = flg
+                            rec["roi_reason"] = f"DB 로드: {why}"
+                            rec["roi_source"] = "db"
+                        else:
+                            rec["roi_flag"] = None
+                            rec["roi_reason"] = ""
+                            rec["roi_source"] = "db"
                         self.images.append(rec)
                         existing.add(key_)
                         added += 1
@@ -4660,6 +4763,16 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                     continue
                 rec["day_var"]  = tk.StringVar(value=rec["day"])
                 rec["cond_var"] = tk.StringVar(value=rec["cond"])
+                # DB 의 ROI 는 그대로 보존 + 품질만 평가 (자동 추정 X)
+                if rec.get("roi") is not None and rec.get("rgb") is not None:
+                    flg, why = evaluate_roi_quality(rec["rgb"], rec["roi"])
+                    rec["roi_flag"] = flg
+                    rec["roi_reason"] = f"DB 로드: {why}"
+                    rec["roi_source"] = "db"
+                else:
+                    rec["roi_flag"] = None
+                    rec["roi_reason"] = ""
+                    rec["roi_source"] = "db"
                 self.images.append(rec)
                 existing_keys.add(key)
                 added += 1
@@ -10598,26 +10711,38 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         self._roi_ok_lbl.configure(
             fg=GREEN if done==total and total>0 else AMBER)
 
+        # 같은 cond 그룹 내 ROI 비율 일관성 점검 — outlier 마킹
+        consistency = check_roi_group_consistency(self.images)
+
         for idx, img in enumerate(self.images):
             is_sel  = (idx == self.sel_idx)
             has_roi = img.get("roi") is not None
             done_a  = not np.isnan(img.get("s_mean", np.nan))
             roi_flag = img.get("roi_flag")
+            inconsistent, group_iou = consistency.get(idx, (False, 1.0))
 
-            # 카드 테두리: 선택 > flag 색상 > 기본
+            # 카드 테두리: 선택 > failed > warn > inconsistent > good > 기본
             if is_sel:
                 brd = ACCENT
             else:
                 brd = _border_color_for_roi(roi_flag, has_roi,
-                    {"green": GREEN, "amber": AMBER, "red": RED, "border": BORDER})
-            # warning/failed 는 굵게 강조
-            thick = 2 if (is_sel or roi_flag in ("warn_small", "warn_off", "warn_paper", "failed")) else 1
+                    {"green": GREEN, "amber": AMBER, "red": RED,
+                     "purple": PURPLE, "border": BORDER},
+                    inconsistent=inconsistent)
+            # warning/failed/inconsistent 는 굵게 강조
+            thick = 2 if (is_sel
+                          or roi_flag in ("warn_small", "warn_off", "warn_paper", "failed")
+                          or (inconsistent and roi_flag != "failed"
+                              and roi_flag not in ("warn_small", "warn_off", "warn_paper"))) else 1
             card = tk.Frame(self._lf,
                             bg=CARD2 if is_sel else CARD,
                             highlightbackground=brd,
                             highlightthickness=thick,
                             cursor="hand2")
             card.pack(fill="x", padx=5, pady=3)
+            # 일관성 점검 결과 카드에 보존 (ROI 라벨에서 사용)
+            img["_roi_inconsistent"] = inconsistent
+            img["_roi_group_iou"] = group_iou
 
             # 썸네일 + 필드
             top = tk.Frame(card, bg=card["bg"])
@@ -10697,12 +10822,12 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                     roi_flag, ("✔", "ROI", "ROI"))
                 roi_txt = (f"{sym} {img['roi'][2]-img['roi'][0]}"
                            f"×{img['roi'][3]-img['roi'][1]}")
-                if roi_flag == "manual" or roi_flag == "good":
-                    roi_col = GREEN
+                if roi_flag == "failed":
+                    roi_col = RED
                 elif roi_flag in ("warn_small", "warn_off", "warn_paper"):
                     roi_col = AMBER
-                elif roi_flag == "failed":
-                    roi_col = RED
+                elif roi_flag in ("manual", "good"):
+                    roi_col = GREEN
                 else:
                     roi_col = GREEN
             else:
@@ -10715,6 +10840,13 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 tk.Label(bot, text=" " + _L(ko_lbl, en_lbl),
                          bg=card["bg"], fg=roi_col,
                          font=("Segoe UI", 7)).pack(side="left")
+            # 같은 조건 그룹 ROI 일관성 — outlier 표시
+            if inconsistent and has_roi:
+                tk.Label(bot,
+                         text=_L(f" ◇ 조건 불일치 (IoU {group_iou*100:.0f}%)",
+                                 f" ◇ Group mismatch (IoU {group_iou*100:.0f}%)"),
+                         bg=card["bg"], fg=PURPLE,
+                         font=("Segoe UI", 7, "bold")).pack(side="left")
 
             # 🎯 ROI 선택 버튼
             tk.Button(bot, text="🎯",
@@ -12495,12 +12627,13 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         self._rebuild_list(); self._refresh_orig()
 
     def _auto_roi_all_unmanual(self):
-        """사용자가 직접 설정(roi_flag='manual')한 이미지를 제외하고 전체에 자동 ROI 재추정."""
+        """사용자 manual 또는 DB 로드 ROI 는 보호하고 나머지에 자동 ROI 재추정."""
         if not self.images:
             self._set_status(_L("이미지 없음", "No images"))
             return
         targets = [i for i, img in enumerate(self.images)
-                   if img.get("roi_flag") != "manual"]
+                   if img.get("roi_flag") != "manual"
+                   and img.get("roi_source") != "db"]
         skipped = len(self.images) - len(targets)
         if not targets:
             self._set_status(_L(f"전부 사용자 설정 ROI — 자동 적용 대상 없음 (보호된 {skipped}장)",
