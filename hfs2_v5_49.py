@@ -361,6 +361,109 @@ def roi_to_mask(shape, roi):
 
 
 # ══════════════════════════════════════════════
+#  자동 ROI 추정 — HfS₂ 시편 vs 흰 종이 분리
+# ══════════════════════════════════════════════
+def auto_detect_roi(rgb: np.ndarray,
+                    margin_ratio: float = 0.10,
+                    paper_v_thresh: int = 215,
+                    paper_s_thresh: int = 25,
+                    min_area_ratio: float = 0.10,
+                    center_off_ratio: float = 0.20,
+                    paper_inside_ratio: float = 0.05) -> tuple:
+    """
+    HfS₂ 시편 사진에서 자동 ROI 추정.
+
+    paper(흰 종이) = 높은 V + 낮은 S 픽셀로 정의.
+    non-paper 영역의 가장 큰 컴포넌트 → bounding box → 안쪽으로 margin 만큼 축소.
+
+    Returns
+    -------
+    roi    : (x0, y0, x1, y1)
+    flag   : 'good' | 'warn_small' | 'warn_off' | 'warn_paper' | 'failed'
+    reason : 한 줄 한국어 설명
+    """
+    h, w = rgb.shape[:2]
+    img_area = h * w
+    img_cx, img_cy = w / 2, h / 2
+
+    # 기본값(폴백): 중앙 50%
+    default_roi = (w // 4, h // 4, 3 * w // 4, 3 * h // 4)
+
+    try:
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        S = hsv[:, :, 1]
+        V = hsv[:, :, 2]
+        paper = (V > paper_v_thresh) & (S < paper_s_thresh)
+        non_paper = (~paper).astype(np.uint8) * 255
+
+        # 형태학 정리 — 점·노이즈 제거 + 시편 내부 구멍 메우기
+        k = max(7, min(h, w) // 80)
+        if k % 2 == 0:
+            k += 1
+        kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        non_paper = cv2.morphologyEx(non_paper, cv2.MORPH_OPEN, kern)
+        non_paper = cv2.morphologyEx(non_paper, cv2.MORPH_CLOSE, kern)
+
+        contours, _ = cv2.findContours(
+            non_paper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return default_roi, "failed", "시편 영역을 찾지 못함 — 수동 설정 필요"
+        c = max(contours, key=cv2.contourArea)
+        x, y, bw, bh = cv2.boundingRect(c)
+
+        # margin 만큼 안쪽으로 축소 (가장자리 그림자/페이퍼 잔존 회피)
+        mx = int(bw * margin_ratio)
+        my = int(bh * margin_ratio)
+        x0 = max(0, x + mx)
+        y0 = max(0, y + my)
+        x1 = min(w, x + bw - mx)
+        y1 = min(h, y + bh - my)
+        if x1 <= x0 + 1 or y1 <= y0 + 1:
+            return default_roi, "failed", "ROI 너비/높이 0 — 수동 설정 필요"
+        roi = (int(x0), int(y0), int(x1), int(y1))
+
+        # 품질 평가
+        roi_area = (x1 - x0) * (y1 - y0)
+        area_ratio = roi_area / img_area
+        if area_ratio < min_area_ratio:
+            return roi, "warn_small", f"ROI 면적 작음 ({area_ratio*100:.0f}%) — 시편 절반 이상이 잘렸을 가능성"
+        roi_cx = (x0 + x1) / 2
+        roi_cy = (y0 + y1) / 2
+        off_x = abs(roi_cx - img_cx) / w
+        off_y = abs(roi_cy - img_cy) / h
+        if off_x > center_off_ratio or off_y > center_off_ratio:
+            return roi, "warn_off", f"ROI 중심 편향 (Δ={max(off_x, off_y)*100:.0f}%) — 한쪽 치우침"
+        roi_paper = paper[y0:y1, x0:x1]
+        paper_in_roi = float(roi_paper.mean()) if roi_paper.size > 0 else 0.0
+        if paper_in_roi > paper_inside_ratio:
+            return roi, "warn_paper", f"ROI 안에 흰 배경 {paper_in_roi*100:.0f}% 포함"
+        return roi, "good", "정상 자동 추정"
+    except Exception as e:
+        return default_roi, "failed", f"오류: {e}"
+
+
+def _border_color_for_roi(flag, has_roi: bool, defaults: dict) -> str:
+    """카드 테두리 색상. defaults = {'green':..,'amber':..,'red':..,'border':..}"""
+    if flag == "manual" or flag == "good":
+        return defaults["green"]
+    if flag in ("warn_small", "warn_off", "warn_paper"):
+        return defaults["amber"]
+    if flag == "failed":
+        return defaults["red"]
+    return defaults["green"] if has_roi else defaults["border"]
+
+
+_ROI_FLAG_LABEL = {
+    "manual":     ("✓", "사용자 확인", "Manual"),
+    "good":       ("✓", "자동 OK",     "Auto OK"),
+    "warn_small": ("⚠", "면적 작음",   "Too small"),
+    "warn_off":   ("⚠", "한쪽 치우침", "Off-center"),
+    "warn_paper": ("⚠", "배경 포함",   "Includes paper"),
+    "failed":     ("✗", "추정 실패",   "Detection failed"),
+}
+
+
+# ══════════════════════════════════════════════
 #  고급 분석 백엔드 — Histogram + FFT + Ensemble
 # ══════════════════════════════════════════════
 
@@ -1657,12 +1760,18 @@ class App(_Base):
         tk.Label(hf, text=_L("  📋 이미지 목록","  📋 Image List"),
                  bg=PANEL2, fg=TXT, font=MFB).pack(side="left",pady=6,padx=8)
 
+        # 자동 ROI 재실행 (사용자가 직접 설정한 것은 보호)
+        tk.Button(hf, text=_L("🤖 자동 ROI","🤖 Auto ROI"),
+                  command=self._auto_roi_all_unmanual,
+                  bg=PANEL2, fg=ACCENT, font=("Segoe UI",8,"bold"),
+                  relief="flat", padx=8, pady=2, cursor="hand2",
+                  activebackground=PANEL).pack(side="left", padx=2, pady=4)
         # 전체 삭제 버튼 (Raman 데이터는 보존)
         tk.Button(hf, text=_L("🗑 전체 삭제","🗑 Delete All"),
                   command=self._delete_all_images,
                   bg=PANEL2, fg=RED, font=("Segoe UI",8,"bold"),
                   relief="flat", padx=8, pady=2, cursor="hand2",
-                  activebackground=PANEL).pack(side="left", padx=4, pady=4)
+                  activebackground=PANEL).pack(side="left", padx=2, pady=4)
 
         self._roi_stat = tk.StringVar(value="ROI 0/0")
         self._roi_ok_lbl = tk.Label(hf, textvariable=self._roi_stat,
@@ -1677,14 +1786,16 @@ class App(_Base):
         tk.Label(gf, text=_L("💡 사용법","💡 How to use"),
                  bg=CARD2, fg=ACCENT, font=MFB).pack(anchor="w", padx=8, pady=(5,1))
         tk.Label(gf,
-                 text=_L("1. 이미지 추가 (드래그앤드롭)\n"
-                         "2. Click 🎯 on a card to set ROI\n"
-                         "   → [⊕Copy All] to apply same ROI\n"
-                         "3. Run [▶ Analyze All]",
-                         "1. Add images (drag & drop)\n"
-                         "2. Set ROI via 🎯 button on card\n"
-                         "   → [⊕Copy All] to apply same ROI\n"
-                         "3. Run [▶ Analyze All]"),
+                 text=_L("1. 이미지 추가 → 자동 ROI 적용됨\n"
+                         "2. 카드 테두리 색으로 품질 확인:\n"
+                         "   🟢 녹색=OK  🟠 주황=검토필요  🔴 빨강=실패\n"
+                         "3. 주황·빨강만 🎯 눌러 수동 보정\n"
+                         "4. Run [▶ Analyze All]",
+                         "1. Add images → auto ROI applied\n"
+                         "2. Card border = quality:\n"
+                         "   🟢 OK  🟠 review  🔴 failed\n"
+                         "3. Fix flagged ones with 🎯\n"
+                         "4. Run [▶ Analyze All]"),
                  bg=CARD2, fg=TXT, font=LF,
                  justify="left").pack(anchor="w", padx=10, pady=(0,2))
         tk.Label(gf, text=_L("✦ 파일명: Nday_MRH_조건명.jpg → 자동인식","✦ Filename: Nday_MRH_Cond.jpg → auto-parsed"),
@@ -10491,13 +10602,20 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             is_sel  = (idx == self.sel_idx)
             has_roi = img.get("roi") is not None
             done_a  = not np.isnan(img.get("s_mean", np.nan))
+            roi_flag = img.get("roi_flag")
 
-            # 카드
-            brd = ACCENT if is_sel else (GREEN if has_roi else BORDER)
+            # 카드 테두리: 선택 > flag 색상 > 기본
+            if is_sel:
+                brd = ACCENT
+            else:
+                brd = _border_color_for_roi(roi_flag, has_roi,
+                    {"green": GREEN, "amber": AMBER, "red": RED, "border": BORDER})
+            # warning/failed 는 굵게 강조
+            thick = 2 if (is_sel or roi_flag in ("warn_small", "warn_off", "warn_paper", "failed")) else 1
             card = tk.Frame(self._lf,
                             bg=CARD2 if is_sel else CARD,
                             highlightbackground=brd,
-                            highlightthickness=2 if is_sel else 1,
+                            highlightthickness=thick,
                             cursor="hand2")
             card.pack(fill="x", padx=5, pady=3)
 
@@ -10573,13 +10691,30 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             bot = tk.Frame(card, bg=card["bg"])
             bot.pack(fill="x", padx=5, pady=(0,5))
 
-            # ROI 상태
-            roi_txt = (f"✔ ROI {img['roi'][2]-img['roi'][0]}"
-                       f"×{img['roi'][3]-img['roi'][1]}"
-                       if has_roi else "○ No ROI")
-            roi_col = GREEN if has_roi else AMBER
+            # ROI 상태 + 자동 추정 flag
+            if has_roi:
+                sym, ko_lbl, en_lbl = _ROI_FLAG_LABEL.get(
+                    roi_flag, ("✔", "ROI", "ROI"))
+                roi_txt = (f"{sym} {img['roi'][2]-img['roi'][0]}"
+                           f"×{img['roi'][3]-img['roi'][1]}")
+                if roi_flag == "manual" or roi_flag == "good":
+                    roi_col = GREEN
+                elif roi_flag in ("warn_small", "warn_off", "warn_paper"):
+                    roi_col = AMBER
+                elif roi_flag == "failed":
+                    roi_col = RED
+                else:
+                    roi_col = GREEN
+            else:
+                roi_txt = "○ No ROI"
+                ko_lbl, en_lbl = "", ""
+                roi_col = AMBER
             tk.Label(bot, text=roi_txt, bg=card["bg"],
                      fg=roi_col, font=MFB).pack(side="left")
+            if ko_lbl:
+                tk.Label(bot, text=" " + _L(ko_lbl, en_lbl),
+                         bg=card["bg"], fg=roi_col,
+                         font=("Segoe UI", 7)).pack(side="left")
 
             # 🎯 ROI 선택 버튼
             tk.Button(bot, text="🎯",
@@ -10643,6 +10778,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             img = target_img if target_img is not None else self.images[idx]
             img["roi"]   = roi
             img["mask"]  = roi_to_mask(img["rgb"].shape, roi)
+            img["roi_flag"] = "manual"
+            img["roi_reason"] = "사용자 직접 설정"
             img["stats"] = {}
             img["s_mean"] = np.nan
             img["yellow_ratio"] = np.nan
@@ -10712,6 +10849,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 scaled = (nx0, ny0, nx1, ny1)
                 other["roi"]   = scaled
                 other["mask"]  = roi_to_mask(other["rgb"].shape, scaled)
+                other["roi_flag"] = "manual"
+                other["roi_reason"] = "Copy All 적용"
                 other["stats"] = {}
                 other["s_mean"] = np.nan
                 other["yellow_ratio"] = np.nan
@@ -10743,6 +10882,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         if idx < 0 or idx >= len(self.images): return
         img = self.images[idx]
         img["roi"] = img["mask"] = None
+        img["roi_flag"] = None
+        img["roi_reason"] = ""
         img["stats"] = {}
         img["s_mean"] = img["yellow_ratio"] = np.nan
         img["thumb"] = make_thumb(img["rgb"], self.TW, self.TH)
@@ -12246,10 +12387,15 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         H_ch,S_ch,I_ch = rgb_to_hsi(rgb)
         auto_day, auto_cond = parse_filename_tags(name)
         auto_parsed = bool(auto_day or auto_cond)
+        # 자동 ROI 추정 — paper 분리 + bounding box + 품질 플래그
+        auto_roi, roi_flag, roi_reason = auto_detect_roi(rgb)
         entry = {
             "name":name, "rgb":rgb,
             "hsi":(H_ch,S_ch,I_ch),
-            "mask":None, "roi":None,
+            "mask": roi_to_mask(rgb.shape, auto_roi),
+            "roi": auto_roi,
+            "roi_flag": roi_flag,
+            "roi_reason": roi_reason,
             "stats":{}, "thumb":None,
             "day_var":  tk.StringVar(value=auto_day),
             "cond_var": tk.StringVar(value=auto_cond),
@@ -12261,16 +12407,15 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                      "homogeneity":np.nan,"correlation":np.nan},
             "delta_e": np.nan,
         }
-        entry["thumb"] = make_thumb(rgb, self.TW, self.TH)
+        entry["thumb"] = make_thumb(rgb, self.TW, self.TH, auto_roi)
         self.images.append(entry)
         if len(self.images)==1: self.sel_idx=0
         self._rebuild_list()
+        sym, ko, en = _ROI_FLAG_LABEL.get(roi_flag, ("•", roi_flag, roi_flag))
         self._set_status(
             _L(f"추가: {name}", f"Added: {name}")
-            + (f"  →  day={auto_day}, cond={auto_cond}"
-               if auto_parsed else
-               _L("  —  day/cond 입력 후 🎯로 ROI 선택",
-                  "  —  enter day/cond then 🎯 Set ROI")))
+            + (f"  →  day={auto_day}, cond={auto_cond}" if auto_parsed else "")
+            + _L(f"  | 자동 ROI {sym} {ko}", f"  | Auto ROI {sym} {en}"))
 
     def _load(self):
         paths=filedialog.askopenfilenames(
@@ -12348,6 +12493,47 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         if self.sel_idx>=len(self.images):
             self.sel_idx=len(self.images)-1
         self._rebuild_list(); self._refresh_orig()
+
+    def _auto_roi_all_unmanual(self):
+        """사용자가 직접 설정(roi_flag='manual')한 이미지를 제외하고 전체에 자동 ROI 재추정."""
+        if not self.images:
+            self._set_status(_L("이미지 없음", "No images"))
+            return
+        targets = [i for i, img in enumerate(self.images)
+                   if img.get("roi_flag") != "manual"]
+        skipped = len(self.images) - len(targets)
+        if not targets:
+            self._set_status(_L(f"전부 사용자 설정 ROI — 자동 적용 대상 없음 (보호된 {skipped}장)",
+                                f"All ROIs are manual — none to auto-apply ({skipped} protected)"))
+            return
+        if not messagebox.askyesno(
+                _L("자동 ROI 재실행", "Re-run Auto ROI"),
+                _L(f"이미지 {len(targets)}장에 자동 ROI 재추정합니다.\n"
+                   f"(직접 설정한 {skipped}장은 보호됨)\n\n계속할까요?",
+                   f"Re-run auto ROI on {len(targets)} images.\n"
+                   f"({skipped} manual ROIs protected)\n\nContinue?")):
+            return
+        flag_cnt = {"good": 0, "warn_small": 0, "warn_off": 0,
+                    "warn_paper": 0, "failed": 0}
+        for i in targets:
+            img = self.images[i]
+            new_roi, new_flag, new_reason = auto_detect_roi(img["rgb"])
+            img["roi"] = new_roi
+            img["mask"] = roi_to_mask(img["rgb"].shape, new_roi)
+            img["roi_flag"] = new_flag
+            img["roi_reason"] = new_reason
+            img["thumb"] = make_thumb(img["rgb"], self.TW, self.TH, new_roi)
+            # 분석 결과는 무효화 (ROI 변경됨)
+            img["stats"] = {}
+            img["s_mean"] = np.nan
+            img["yellow_ratio"] = np.nan
+            flag_cnt[new_flag] = flag_cnt.get(new_flag, 0) + 1
+        self._rebuild_list()
+        try: self._refresh_orig()
+        except Exception: pass
+        self._set_status(_L(
+            f"✓ 자동 ROI 완료 — OK {flag_cnt['good']} | 경고 {flag_cnt['warn_small']+flag_cnt['warn_off']+flag_cnt['warn_paper']} | 실패 {flag_cnt['failed']} | 보호 {skipped}",
+            f"✓ Auto ROI done — OK {flag_cnt['good']} | Warn {flag_cnt['warn_small']+flag_cnt['warn_off']+flag_cnt['warn_paper']} | Fail {flag_cnt['failed']} | Protected {skipped}"))
 
     def _delete_all_images(self):
         """이미지 목록만 전체 삭제 (Raman 데이터는 보존)."""
