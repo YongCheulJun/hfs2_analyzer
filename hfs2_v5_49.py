@@ -1312,12 +1312,23 @@ import sqlite3, json as _json, pickle as _pickle
 
 _DB_VERSION = 2   # 스키마 변경 시 증가
 
+def _db_open_safe(path: str, timeout: float = 15.0) -> sqlite3.Connection:
+    """WSL/네트워크 마운트 호환 SQLite connection 헬퍼.
+
+    \\\\wsl$\\... 같은 9p 마운트에서 WAL 모드는 .shm/.wal 파일 lock 충돌
+    유발 → 안전한 DELETE 모드 (기본 rollback journal) 사용.
+    busy_timeout 으로 OS-레벨 lock 도 15초까지 대기.
+    """
+    con = sqlite3.connect(path, timeout=timeout)
+    con.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+    con.execute("PRAGMA journal_mode=DELETE")
+    con.execute("PRAGMA synchronous=NORMAL")
+    return con
+
+
 def db_init(path: str) -> sqlite3.Connection:
     """DB 파일을 열고 테이블이 없으면 생성"""
-    con = sqlite3.connect(path, timeout=15.0)
-    con.execute("PRAGMA busy_timeout=15000")
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA synchronous=NORMAL")
+    con = _db_open_safe(path)
     con.execute(f"""
         CREATE TABLE IF NOT EXISTS meta (
             key   TEXT PRIMARY KEY,
@@ -4869,7 +4880,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         for path in paths:
             fname = os.path.basename(path).lower()
             try:
-                con = _sq.connect(path)
+                con = _db_open_safe(path)
                 tables = {r[0] for r in
                           con.execute("SELECT name FROM sqlite_master"
                                       " WHERE type='table'").fetchall()}
@@ -4977,7 +4988,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             # (연속 connect 시 SQLite WAL lock 충돌 방지)
             eval_note = ""
             import sqlite3 as _sq, pickle as _pk, json as _js
-            con = _sq.connect(path, timeout=15.0)
+            con = _db_open_safe(path)
             try:
                 con.execute("PRAGMA busy_timeout=15000")
                 # 평가 대상 이미지 (다중 target)
@@ -5067,7 +5078,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 # 평가 대상 (있으면 첫 파일에서만 — 누적 시 충돌 가능)
                 try:
                     import sqlite3 as _sq
-                    con = _sq.connect(path, timeout=15.0)
+                    con = _db_open_safe(path)
                     cur = con.execute(
                         "SELECT name FROM sqlite_master "
                         "WHERE type='table' AND name='eval_target'")
@@ -5142,7 +5153,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         if not path: return
         try:
             import sqlite3 as _sq, pickle as _pk, json as _js
-            con = _sq.connect(path, timeout=15.0)
+            con = _db_open_safe(path)
             n_saved = 0
             try:
                 con.execute("PRAGMA busy_timeout=15000")
@@ -5256,7 +5267,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         """평가 대상 이미지 로드 (내부 공용 — 다중 target)"""
         try:
             import sqlite3 as _sq
-            con = _sq.connect(path)
+            con = _db_open_safe(path)
             cur = con.execute(
                 "SELECT name FROM sqlite_master "
                 "WHERE type='table' AND name='eval_target'")
@@ -5293,7 +5304,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         if not path: return
         try:
             import sqlite3 as _sq, json as _js
-            con = _sq.connect(path)
+            con = _db_open_safe(path)
             con.execute("""CREATE TABLE IF NOT EXISTS raman_data
                 (id INTEGER PRIMARY KEY,
                  cond TEXT, day TEXT, peak REAL,
@@ -5345,7 +5356,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         """Raman 데이터 로드 (내부 공용). 추가된 항목 수 반환."""
         try:
             import sqlite3 as _sq, json as _js
-            con = _sq.connect(path)
+            con = _db_open_safe(path)
             rows = con.execute(
                 "SELECT cond,day,peak,norm_peak,peak_shift,"
                 "peak_range,spectrum_json FROM raman_data"
