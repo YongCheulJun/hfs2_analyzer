@@ -1,0 +1,34 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 이미지/DB 캐시
+*.db
+*.sqlite
+*.sqlite3
+cache_data/
+thumbs/
+*.bak
+
+# 사용자 설정
+settings.json
+settings_v*.json
+*.local.json
+
+# 데이터/이미지 (분석 대상은 별도 보관)
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+data/
+samples/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
