@@ -367,29 +367,31 @@ def roi_to_mask(shape, roi):
 #  자동 ROI 추정 — HfS₂ 시편 vs 흰 종이 분리
 # ══════════════════════════════════════════════
 def auto_detect_roi(rgb: np.ndarray,
-                    margin_ratio: float = 0.25,
                     paper_v_thresh: int = 215,
                     paper_s_thresh: int = 25,
-                    min_area_ratio: float = 0.08,
-                    center_off_ratio: float = 0.20,
-                    paper_inside_ratio: float = 0.03) -> tuple:
+                    min_area_ratio: float = 0.05,
+                    paper_inside_ratio: float = 0.01) -> tuple:
     """
     HfS₂ 시편 사진에서 자동 ROI 추정.
 
-    paper(흰 종이) = 높은 V + 낮은 S 픽셀로 정의.
-    non-paper 영역의 가장 큰 컴포넌트 → bounding box → 안쪽으로 margin 만큼 축소.
+    알고리즘 (off-center 허용, paper 강력 회피):
+    1) HSV V/S 임계로 paper 마스크 추출
+    2) non_paper 마스크 형태학 정리
+    3) Distance transform → paper 까지 거리가 가장 먼 시편 안쪽 anchor 점 찾기
+    4) anchor 주변 안전 정사각형(거리의 70%) 으로 시작
+    5) 각 변 독립적으로 1픽셀씩 확장 시도 — paper 비율 < 1% 유지
+    6) 시편 모양에 자동 맞춰진 직사각형 ROI
+
+    중앙 가정 X — anchor 가 시편 안에서 가장 안쪽이면 됨.
 
     Returns
     -------
     roi    : (x0, y0, x1, y1)
-    flag   : 'good' | 'warn_small' | 'warn_off' | 'warn_paper' | 'failed'
+    flag   : 'good' | 'warn_small' | 'warn_paper' | 'failed'
     reason : 한 줄 한국어 설명
     """
     h, w = rgb.shape[:2]
     img_area = h * w
-    img_cx, img_cy = w / 2, h / 2
-
-    # 기본값(폴백): 중앙 50%
     default_roi = (w // 4, h // 4, 3 * w // 4, 3 * h // 4)
 
     try:
@@ -399,7 +401,7 @@ def auto_detect_roi(rgb: np.ndarray,
         paper = (V > paper_v_thresh) & (S < paper_s_thresh)
         non_paper = (~paper).astype(np.uint8) * 255
 
-        # 형태학 정리 — 점·노이즈 제거 + 시편 내부 구멍 메우기
+        # 형태학 정리
         k = max(7, min(h, w) // 80)
         if k % 2 == 0:
             k += 1
@@ -407,39 +409,76 @@ def auto_detect_roi(rgb: np.ndarray,
         non_paper = cv2.morphologyEx(non_paper, cv2.MORPH_OPEN, kern)
         non_paper = cv2.morphologyEx(non_paper, cv2.MORPH_CLOSE, kern)
 
+        # 가장 큰 컴포넌트만 남김 (다른 작은 잡음 제거)
         contours, _ = cv2.findContours(
             non_paper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return default_roi, "failed", "시편 영역을 찾지 못함 — 수동 설정 필요"
-        c = max(contours, key=cv2.contourArea)
-        x, y, bw, bh = cv2.boundingRect(c)
+        c_main = max(contours, key=cv2.contourArea)
+        main_mask = np.zeros_like(non_paper)
+        cv2.drawContours(main_mask, [c_main], -1, 255, thickness=cv2.FILLED)
 
-        # margin 만큼 안쪽으로 축소 (가장자리 그림자/페이퍼 잔존 회피)
-        mx = int(bw * margin_ratio)
-        my = int(bh * margin_ratio)
-        x0 = max(0, x + mx)
-        y0 = max(0, y + my)
-        x1 = min(w, x + bw - mx)
-        y1 = min(h, y + bh - my)
+        # Distance transform — 시편 안쪽에서 paper 까지의 최대 거리
+        dist = cv2.distanceTransform(main_mask, cv2.DIST_L2, 5)
+        _, max_dist, _, max_loc = cv2.minMaxLoc(dist)
+        if max_dist < 8:
+            return default_roi, "failed", f"시편 안쪽 폭 너무 좁음 (max_d={max_dist:.0f}px)"
+        cx, cy = int(max_loc[0]), int(max_loc[1])
+
+        # anchor 주변 안전 정사각형 시작 — max_dist 의 70%
+        safe = int(max_dist * 0.70)
+        x0 = max(0, cx - safe)
+        y0 = max(0, cy - safe)
+        x1 = min(w, cx + safe)
+        y1 = min(h, cy + safe)
+
+        # 각 변 독립 확장 — paper 비율 < target 유지
+        target = paper_inside_ratio
+        step = max(2, min(h, w) // 250)
+        max_iter = 200
+        for _ in range(max_iter):
+            grown = False
+            # left
+            if x0 > 0:
+                nx = max(0, x0 - step)
+                sub = paper[y0:y1, nx:x1]
+                if sub.size > 0 and float(sub.mean()) <= target:
+                    x0 = nx; grown = True
+            # right
+            if x1 < w:
+                nx = min(w, x1 + step)
+                sub = paper[y0:y1, x0:nx]
+                if sub.size > 0 and float(sub.mean()) <= target:
+                    x1 = nx; grown = True
+            # top
+            if y0 > 0:
+                ny = max(0, y0 - step)
+                sub = paper[ny:y1, x0:x1]
+                if sub.size > 0 and float(sub.mean()) <= target:
+                    y0 = ny; grown = True
+            # bottom
+            if y1 < h:
+                ny = min(h, y1 + step)
+                sub = paper[y0:ny, x0:x1]
+                if sub.size > 0 and float(sub.mean()) <= target:
+                    y1 = ny; grown = True
+            if not grown:
+                break
+
         if x1 <= x0 + 1 or y1 <= y0 + 1:
             return default_roi, "failed", "ROI 너비/높이 0 — 수동 설정 필요"
         roi = (int(x0), int(y0), int(x1), int(y1))
 
-        # 품질 평가
+        # 품질 평가 — 중앙 편향 검사 제거 (off-center OK)
         roi_area = (x1 - x0) * (y1 - y0)
         area_ratio = roi_area / img_area
         if area_ratio < min_area_ratio:
-            return roi, "warn_small", f"ROI 면적 작음 ({area_ratio*100:.0f}%) — 시편 절반 이상이 잘렸을 가능성"
-        roi_cx = (x0 + x1) / 2
-        roi_cy = (y0 + y1) / 2
-        off_x = abs(roi_cx - img_cx) / w
-        off_y = abs(roi_cy - img_cy) / h
-        if off_x > center_off_ratio or off_y > center_off_ratio:
-            return roi, "warn_off", f"ROI 중심 편향 (Δ={max(off_x, off_y)*100:.0f}%) — 한쪽 치우침"
+            return roi, "warn_small", f"ROI 면적 작음 ({area_ratio*100:.0f}%)"
         roi_paper = paper[y0:y1, x0:x1]
         paper_in_roi = float(roi_paper.mean()) if roi_paper.size > 0 else 0.0
-        if paper_in_roi > paper_inside_ratio:
-            return roi, "warn_paper", f"ROI 안에 흰 배경 {paper_in_roi*100:.0f}% 포함"
+        # 확장 알고리즘이 target 유지하므로 보통 통과. 안전망.
+        if paper_in_roi > max(0.02, target * 2):
+            return roi, "warn_paper", f"ROI 안 흰 배경 {paper_in_roi*100:.1f}% 포함"
         return roi, "good", "정상 자동 추정"
     except Exception as e:
         return default_roi, "failed", f"오류: {e}"
@@ -448,11 +487,11 @@ def auto_detect_roi(rgb: np.ndarray,
 def evaluate_roi_quality(rgb: np.ndarray, roi: tuple,
                          paper_v_thresh: int = 215,
                          paper_s_thresh: int = 25,
-                         min_area_ratio: float = 0.08,
-                         center_off_ratio: float = 0.20,
-                         paper_inside_ratio: float = 0.03) -> tuple:
+                         min_area_ratio: float = 0.05,
+                         paper_inside_ratio: float = 0.02) -> tuple:
     """주어진 ROI 에 대해 품질만 평가 (자동 추정 X — DB 로드 등에 사용).
-    Returns (flag, reason) — flag ∈ good / warn_small / warn_off / warn_paper / failed
+    중앙 편향 검사는 제거 (off-center OK — 사용자 정책).
+    Returns (flag, reason) — flag ∈ good / warn_small / warn_paper / failed
     """
     if rgb is None or roi is None:
         return "failed", "이미지 또는 ROI 없음"
@@ -461,16 +500,10 @@ def evaluate_roi_quality(rgb: np.ndarray, roi: tuple,
     if x1 <= x0 or y1 <= y0:
         return "failed", "ROI 너비/높이 0"
     img_area = h * w
-    img_cx, img_cy = w / 2, h / 2
     roi_area = (x1 - x0) * (y1 - y0)
     area_ratio = roi_area / img_area
     if area_ratio < min_area_ratio:
         return "warn_small", f"ROI 면적 작음 ({area_ratio*100:.0f}%)"
-    rcx = (x0 + x1) / 2
-    rcy = (y0 + y1) / 2
-    off = max(abs(rcx - img_cx) / w, abs(rcy - img_cy) / h)
-    if off > center_off_ratio:
-        return "warn_off", f"ROI 중심 편향 (Δ={off*100:.0f}%)"
     try:
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         paper = (hsv[:, :, 2] > paper_v_thresh) & (hsv[:, :, 1] < paper_s_thresh)
