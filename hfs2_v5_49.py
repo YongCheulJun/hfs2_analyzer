@@ -4972,76 +4972,103 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             messagebox.showerror("Save Error", str(ex))
 
     def _db_load(self):
-        path = filedialog.askopenfilename(
-            title="Open DB File",
+        """이미지 DB 파일 1개 또는 복수 로드 (다중 선택 지원)."""
+        paths = filedialog.askopenfilenames(
+            title=_L("이미지 DB 파일 선택 (복수 가능)",
+                     "Open Image DB Files (multi-select)"),
             filetypes=[("HfS2 DB","*.db"),("All","*.*")])
-        if not path: return
+        if not paths:
+            return
 
-        try:
-            records = db_load_all(path)
-            if not records:
-                messagebox.showinfo("Info","No data in DB."); return
+        existing_keys = {
+            (img["name"], img["cond"], img["day"])
+            for img in self.images}
+        total_added = 0
+        total_dup = 0
+        total_eval = 0
+        per_file = []
+        errors = []
 
-            existing_keys = {
-                (img["name"], img["cond"], img["day"])
-                for img in self.images}
-            added = 0
-            for rec in records:
-                key = (rec["name"], rec["cond"], rec["day"])
-                if key in existing_keys:
-                    continue
-                rec["day_var"]  = tk.StringVar(value=rec["day"])
-                rec["cond_var"] = tk.StringVar(value=rec["cond"])
-                # DB 의 ROI 는 그대로 보존 + 품질만 평가 (자동 추정 X)
-                if rec.get("roi") is not None and rec.get("rgb") is not None:
-                    flg, why = evaluate_roi_quality(rec["rgb"], rec["roi"])
-                    rec["roi_flag"] = flg
-                    rec["roi_reason"] = f"DB 로드: {why}"
-                    rec["roi_source"] = "db"
-                else:
-                    rec["roi_flag"] = None
-                    rec["roi_reason"] = ""
-                    rec["roi_source"] = "db"
-                self.images.append(rec)
-                existing_keys.add(key)
-                added += 1
-
-            if self.sel_idx < 0 and self.images:
-                self.sel_idx = 0
-            self._rebuild_list()
-
-            # 평가 대상 이미지 복원 (다중 target)
-            eval_note = ""
+        for path in paths:
             try:
-                import sqlite3 as _sq, pickle as _pk, json as _js
-                con = _sq.connect(path)
-                # 테이블 존재 확인
-                cur = con.execute(
-                    "SELECT name FROM sqlite_master "
-                    "WHERE type='table' AND name='eval_target'")
-                if cur.fetchone():
-                    _migrate_eval_target_schema(con)
-                    rows = list(con.execute(
-                        "SELECT target_id, name, rgb_blob, roi, "
-                        "color, cond_hint "
-                        "FROM eval_target ORDER BY target_id"))
-                    n_loaded = self._pred_load_rows(rows)
-                    if n_loaded > 0:
-                        eval_note = (f"\n+ {n_loaded} evaluation "
-                                     "target(s) restored.")
-                        self.after(150, self._pred_rebuild_cards)
-                con.close()
-            except Exception:
-                pass  # eval_target 테이블 없으면 무시
+                records = db_load_all(path)
+                if not records:
+                    per_file.append((os.path.basename(path), 0, 0))
+                    continue
 
-            messagebox.showinfo("Loaded",
-                f"Loaded {added} images from DB.\n"
-                f"({len(records)-added} duplicates excluded)"
-                + eval_note)
-            self._set_status(
-                f"📂 DB loaded — {added} records  ({os.path.basename(path)})")
-        except Exception as ex:
-            messagebox.showerror("Load Error", str(ex))
+                added = 0
+                dup = 0
+                for rec in records:
+                    key = (rec["name"], rec["cond"], rec["day"])
+                    if key in existing_keys:
+                        dup += 1
+                        continue
+                    rec["day_var"]  = tk.StringVar(value=rec["day"])
+                    rec["cond_var"] = tk.StringVar(value=rec["cond"])
+                    if rec.get("roi") is not None and rec.get("rgb") is not None:
+                        flg, why = evaluate_roi_quality(rec["rgb"], rec["roi"])
+                        rec["roi_flag"] = flg
+                        rec["roi_reason"] = f"DB 로드: {why}"
+                        rec["roi_source"] = "db"
+                    else:
+                        rec["roi_flag"] = None
+                        rec["roi_reason"] = ""
+                        rec["roi_source"] = "db"
+                    self.images.append(rec)
+                    existing_keys.add(key)
+                    added += 1
+                total_added += added
+                total_dup += dup
+                per_file.append((os.path.basename(path), added, dup))
+
+                # 평가 대상 (있으면 첫 파일에서만 — 누적 시 충돌 가능)
+                try:
+                    import sqlite3 as _sq
+                    con = _sq.connect(path, timeout=15.0)
+                    cur = con.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type='table' AND name='eval_target'")
+                    if cur.fetchone():
+                        _migrate_eval_target_schema(con)
+                        rows = list(con.execute(
+                            "SELECT target_id, name, rgb_blob, roi, "
+                            "color, cond_hint "
+                            "FROM eval_target ORDER BY target_id"))
+                        n_loaded = self._pred_load_rows(rows)
+                        total_eval += n_loaded
+                    con.close()
+                except Exception:
+                    pass
+            except Exception as ex:
+                errors.append((os.path.basename(path), str(ex)))
+
+        if self.sel_idx < 0 and self.images:
+            self.sel_idx = 0
+        self._rebuild_list()
+        if total_eval > 0:
+            self.after(150, self._pred_rebuild_cards)
+
+        # 결과 메시지
+        lines = [_L(f"DB 파일 {len(paths)}개 로드 완료",
+                    f"Loaded {len(paths)} DB file(s)"),
+                 ""]
+        for name, a, d in per_file:
+            lines.append(f"  • {name}: +{a}장 (중복 {d})")
+        lines.append("")
+        lines.append(_L(f"총 추가: {total_added}장 | 중복 제외: {total_dup}장",
+                        f"Total: +{total_added} | Duplicates: {total_dup}"))
+        if total_eval > 0:
+            lines.append(_L(f"평가대상 복원: {total_eval}개",
+                            f"Evaluation targets restored: {total_eval}"))
+        if errors:
+            lines.append("")
+            lines.append(_L("⚠ 오류:", "⚠ Errors:"))
+            for name, err in errors:
+                lines.append(f"  • {name}: {err}")
+        messagebox.showinfo(_L("로드 결과", "Load Result"), "\n".join(lines))
+        self._set_status(
+            _L(f"📂 DB 로드 — {total_added}장  ({len(paths)}개 파일)",
+               f"📂 DB loaded — {total_added} records  ({len(paths)} files)"))
 
 
 
