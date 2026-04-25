@@ -366,45 +366,57 @@ def roi_to_mask(shape, roi):
 # ══════════════════════════════════════════════
 #  자동 ROI 추정 — HfS₂ 시편 vs 흰 종이 분리
 # ══════════════════════════════════════════════
-def _find_right_angle_corner(contour, sx, sy, sbw, sbh):
-    """시편 contour 에서 90도(직각) 에 가장 가까운 꼭짓점 찾기.
+def _find_straightest_side_midpoint(contour, sx, sy, sbw, sbh):
+    """시편 contour 에서 곡률이 가장 낮은 (가장 직선에 가까운) 쪽의 중점.
 
-    approxPolyDP 로 다각형 근사 후, 각 vertex 의 끼인각 측정.
-    90도 와의 차이가 작고 인접 변이 충분히 긴 vertex 가 "직각 corner".
+    bbox 중심에서 4 사분면(상/하/좌/우) 으로 contour 점들을 분류한 뒤,
+    각 사분면 점 분포에 PCA 적용 → 작은 eigenvalue / 큰 eigenvalue 비율
+    이 작을수록 직선에 가까움 (0 = 완벽 직선, 1 = 원).
 
     Returns: (cx, cy) or None
     """
     try:
-        peri = cv2.arcLength(contour, True)
-        best_pt = None
+        pts = contour.reshape(-1, 2).astype(float)
+        if len(pts) < 8:
+            return None
+        cx_bb = sx + sbw / 2.0
+        cy_bb = sy + sbh / 2.0
+
+        sides = {"top": [], "bottom": [], "left": [], "right": []}
+        for p in pts:
+            dx = p[0] - cx_bb
+            dy = p[1] - cy_bb
+            if abs(dx) > abs(dy):
+                sides["right" if dx > 0 else "left"].append(p)
+            else:
+                sides["bottom" if dy > 0 else "top"].append(p)
+
         best_score = float("inf")
-        # 여러 epsilon 시도 — 안정적인 결과 확보
-        for eps_factor in (0.01, 0.02, 0.03):
-            approx = cv2.approxPolyDP(contour, eps_factor * peri, True)
-            if len(approx) < 3 or len(approx) > 16:
+        best_mid = None
+        total = len(pts)
+        for name, side_pts in sides.items():
+            if len(side_pts) < 5:
                 continue
-            pts = approx.reshape(-1, 2)
-            n = len(pts)
-            for i in range(n):
-                p_prev = pts[(i - 1) % n].astype(float)
-                p_curr = pts[i].astype(float)
-                p_next = pts[(i + 1) % n].astype(float)
-                v1 = p_prev - p_curr
-                v2 = p_next - p_curr
-                n1 = float(np.linalg.norm(v1))
-                n2 = float(np.linalg.norm(v2))
-                if n1 < 5 or n2 < 5:
-                    continue
-                cos_a = float(np.dot(v1, v2) / (n1 * n2))
-                cos_a = max(-1.0, min(1.0, cos_a))
-                angle = float(np.degrees(np.arccos(cos_a)))
-                # 90도와의 거리, 변 길이 가중치 (긴 변일수록 신뢰도 ↑)
-                weighted = abs(angle - 90.0) - min(15.0, (n1 + n2) / max(sbw, sbh) * 30)
-                if weighted < best_score:
-                    best_score = weighted
-                    best_pt = (float(p_curr[0]), float(p_curr[1]))
-        if best_pt is not None and best_score < 25.0:  # 90 ± 25도 이내만 인정
-            return best_pt
+            arr = np.array(side_pts)
+            mean = arr.mean(axis=0)
+            centered = arr - mean
+            cov = (centered.T @ centered) / max(1, len(centered) - 1)
+            try:
+                eigvals = np.linalg.eigvalsh(cov)
+            except Exception:
+                continue
+            eigvals = np.sort(eigvals)
+            if eigvals[1] < 1.0:
+                continue
+            straight = float(eigvals[0] / eigvals[1])  # 0 ≈ 직선, 1 ≈ 원
+            # 사이드 점 수가 너무 적으면 신뢰도 낮음 → 패널티
+            if len(side_pts) < total * 0.10:
+                straight += 0.3
+            if straight < best_score:
+                best_score = straight
+                best_mid = (float(mean[0]), float(mean[1]))
+        if best_mid is not None and best_score < 0.25:
+            return best_mid
     except Exception:
         pass
     return None
@@ -416,7 +428,7 @@ def auto_detect_roi(rgb: np.ndarray,
                     target_area_ratio: float = 0.16,
                     max_specimen_fraction: float = 0.70,
                     edge_margin_ratio: float = 0.05,
-                    corner_bias_ratio: float = 0.18,
+                    bias_ratio: float = 0.22,
                     min_area_ratio: float = 0.04,
                     paper_inside_ratio: float = 0.02) -> tuple:
     """
@@ -424,7 +436,8 @@ def auto_detect_roi(rgb: np.ndarray,
 
     DB pkw_1.db 의 사용자 패턴 + 사용자 추가 요구:
       - ROI 면적 ≈ 이미지의 16% (DB 23.8% 보다 약 30% 작게)
-      - ROI 중심 ≈ 시편 bbox 중심에서 직각 corner 쪽으로 18% 이동
+      - ROI 중심 ≈ 시편 bbox 중심에서 **곡률이 가장 낮은(직선에 가까운) 쪽**
+        의 중점 방향으로 22% 이동
       - 가로/세로 비 = 시편 bbox 비율
       - 이미지 가장자리 5% 안쪽 보장
 
@@ -432,10 +445,11 @@ def auto_detect_roi(rgb: np.ndarray,
     1) HSV V/S 로 paper 마스크 추출
     2) non_paper 형태학 정리 (open + close)
     3) 가장 큰 contour 의 bbox = 시편 bbox (sx, sy, sbw, sbh)
-    4) approxPolyDP 로 시편 직각 corner 검출 (`_find_right_angle_corner`)
+    4) `_find_straightest_side_midpoint` — bbox 중심으로 contour 점을 4 사분면
+       으로 분류, 각 사분면 PCA 직진성 측정, 가장 직선에 가까운 사이드 중점 반환
     5) 목표 ROI 너비/높이 산출 (target_area_ratio + aspect)
-    6) ROI 중심 = bbox 중심 + (corner - bbox 중심) × corner_bias_ratio
-       corner 못 찾으면 bbox 중심 그대로
+    6) ROI 중심 = bbox 중심 + (직선 사이드 중점 - bbox 중심) × bias_ratio
+       못 찾으면 bbox 중심 그대로
     7) edge_margin_ratio (5%) 안쪽으로 밀어넣기
     8) 품질 평가: 면적 / 가장자리 근접 / paper 비율
 
@@ -483,13 +497,13 @@ def auto_detect_roi(rgb: np.ndarray,
         roi_w = max(roi_w, int(min(w, sbw) * 0.18))
         roi_h = max(roi_h, int(min(h, sbh) * 0.18))
 
-        # ROI 중심 — bbox 중심에서 직각 corner 쪽으로 약간 이동
+        # ROI 중심 — bbox 중심에서 곡률 낮은 사이드 중점 쪽으로 약간 이동
         cx_base = sx + sbw / 2
         cy_base = sy + sbh / 2
-        corner = _find_right_angle_corner(c, sx, sy, sbw, sbh)
-        if corner is not None:
-            cx = cx_base + (corner[0] - cx_base) * corner_bias_ratio
-            cy = cy_base + (corner[1] - cy_base) * corner_bias_ratio
+        target_pt = _find_straightest_side_midpoint(c, sx, sy, sbw, sbh)
+        if target_pt is not None:
+            cx = cx_base + (target_pt[0] - cx_base) * bias_ratio
+            cy = cy_base + (target_pt[1] - cy_base) * bias_ratio
         else:
             cx, cy = cx_base, cy_base
 
