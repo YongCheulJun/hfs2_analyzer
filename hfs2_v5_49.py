@@ -366,36 +366,78 @@ def roi_to_mask(shape, roi):
 # ══════════════════════════════════════════════
 #  자동 ROI 추정 — HfS₂ 시편 vs 흰 종이 분리
 # ══════════════════════════════════════════════
+def _find_right_angle_corner(contour, sx, sy, sbw, sbh):
+    """시편 contour 에서 90도(직각) 에 가장 가까운 꼭짓점 찾기.
+
+    approxPolyDP 로 다각형 근사 후, 각 vertex 의 끼인각 측정.
+    90도 와의 차이가 작고 인접 변이 충분히 긴 vertex 가 "직각 corner".
+
+    Returns: (cx, cy) or None
+    """
+    try:
+        peri = cv2.arcLength(contour, True)
+        best_pt = None
+        best_score = float("inf")
+        # 여러 epsilon 시도 — 안정적인 결과 확보
+        for eps_factor in (0.01, 0.02, 0.03):
+            approx = cv2.approxPolyDP(contour, eps_factor * peri, True)
+            if len(approx) < 3 or len(approx) > 16:
+                continue
+            pts = approx.reshape(-1, 2)
+            n = len(pts)
+            for i in range(n):
+                p_prev = pts[(i - 1) % n].astype(float)
+                p_curr = pts[i].astype(float)
+                p_next = pts[(i + 1) % n].astype(float)
+                v1 = p_prev - p_curr
+                v2 = p_next - p_curr
+                n1 = float(np.linalg.norm(v1))
+                n2 = float(np.linalg.norm(v2))
+                if n1 < 5 or n2 < 5:
+                    continue
+                cos_a = float(np.dot(v1, v2) / (n1 * n2))
+                cos_a = max(-1.0, min(1.0, cos_a))
+                angle = float(np.degrees(np.arccos(cos_a)))
+                # 90도와의 거리, 변 길이 가중치 (긴 변일수록 신뢰도 ↑)
+                weighted = abs(angle - 90.0) - min(15.0, (n1 + n2) / max(sbw, sbh) * 30)
+                if weighted < best_score:
+                    best_score = weighted
+                    best_pt = (float(p_curr[0]), float(p_curr[1]))
+        if best_pt is not None and best_score < 25.0:  # 90 ± 25도 이내만 인정
+            return best_pt
+    except Exception:
+        pass
+    return None
+
+
 def auto_detect_roi(rgb: np.ndarray,
                     paper_v_thresh: int = 215,
                     paper_s_thresh: int = 25,
-                    target_area_ratio: float = 0.22,
-                    max_specimen_fraction: float = 0.80,
+                    target_area_ratio: float = 0.16,
+                    max_specimen_fraction: float = 0.70,
                     edge_margin_ratio: float = 0.05,
-                    min_area_ratio: float = 0.05,
+                    corner_bias_ratio: float = 0.18,
+                    min_area_ratio: float = 0.04,
                     paper_inside_ratio: float = 0.02) -> tuple:
     """
     HfS₂ 시편 사진에서 자동 ROI 추정.
 
-    DB pkw_1.db 의 사용자 패턴에 맞춤:
-      - ROI 면적 ≈ 이미지의 22% (DB 평균 23.8%)
-      - ROI 중심 ≈ 시편 bbox 중심 (대략 이미지 중심부)
-      - 가로/세로 비 = 시편 bbox 비율 (시편이 가로로 길면 ROI 도 가로)
-      - 이미지 가장자리에 닿지 않게 안전 margin 보장
+    DB pkw_1.db 의 사용자 패턴 + 사용자 추가 요구:
+      - ROI 면적 ≈ 이미지의 16% (DB 23.8% 보다 약 30% 작게)
+      - ROI 중심 ≈ 시편 bbox 중심에서 직각 corner 쪽으로 18% 이동
+      - 가로/세로 비 = 시편 bbox 비율
+      - 이미지 가장자리 5% 안쪽 보장
 
     알고리즘:
     1) HSV V/S 로 paper 마스크 추출
     2) non_paper 형태학 정리 (open + close)
     3) 가장 큰 contour 의 bbox = 시편 bbox (sx, sy, sbw, sbh)
-    4) 목표 ROI 너비/높이 산출:
-         - target_area = img_area * target_area_ratio
-         - aspect = sbw / sbh (시편 가로/세로 비)
-         - roi_w = sqrt(target_area * aspect)
-         - roi_h = sqrt(target_area / aspect)
-       단, ROI 가 시편 bbox 의 max_specimen_fraction (80%) 보다 크면 캡
-    5) ROI 중심 = 시편 bbox 중심
-    6) edge_margin_ratio (5%) 안쪽으로 밀어넣기 — 가장자리 안전 보장
-    7) 품질 평가: 면적 / 가장자리 근접 / paper 비율
+    4) approxPolyDP 로 시편 직각 corner 검출 (`_find_right_angle_corner`)
+    5) 목표 ROI 너비/높이 산출 (target_area_ratio + aspect)
+    6) ROI 중심 = bbox 중심 + (corner - bbox 중심) × corner_bias_ratio
+       corner 못 찾으면 bbox 중심 그대로
+    7) edge_margin_ratio (5%) 안쪽으로 밀어넣기
+    8) 품질 평가: 면적 / 가장자리 근접 / paper 비율
 
     Returns
     -------
@@ -431,26 +473,29 @@ def auto_detect_roi(rgb: np.ndarray,
         if sbw < 10 or sbh < 10:
             return default_roi, "failed", "시편 영역이 너무 작음"
 
-        # 목표 ROI 크기 — DB 패턴 면적 + 시편 모양 비율
+        # 목표 ROI 크기 — 면적 비율 + 시편 모양 aspect
         target_area = img_area * target_area_ratio
         aspect = sbw / sbh if sbh > 0 else 1.0
         roi_w = int((target_area * aspect) ** 0.5)
         roi_h = int((target_area / aspect) ** 0.5)
-        # 시편 bbox 보다 크지 않게 캡
         roi_w = min(roi_w, int(sbw * max_specimen_fraction))
         roi_h = min(roi_h, int(sbh * max_specimen_fraction))
-        # 너무 작아지면 최소 보장
-        roi_w = max(roi_w, int(min(w, sbw) * 0.20))
-        roi_h = max(roi_h, int(min(h, sbh) * 0.20))
+        roi_w = max(roi_w, int(min(w, sbw) * 0.18))
+        roi_h = max(roi_h, int(min(h, sbh) * 0.18))
 
-        # ROI 중심 = 시편 bbox 중심
-        cx = sx + sbw / 2
-        cy = sy + sbh / 2
+        # ROI 중심 — bbox 중심에서 직각 corner 쪽으로 약간 이동
+        cx_base = sx + sbw / 2
+        cy_base = sy + sbh / 2
+        corner = _find_right_angle_corner(c, sx, sy, sbw, sbh)
+        if corner is not None:
+            cx = cx_base + (corner[0] - cx_base) * corner_bias_ratio
+            cy = cy_base + (corner[1] - cy_base) * corner_bias_ratio
+        else:
+            cx, cy = cx_base, cy_base
 
         # 가장자리 안전 margin — 안쪽으로 밀어넣기
         margin_x = int(w * edge_margin_ratio)
         margin_y = int(h * edge_margin_ratio)
-
         x0 = int(cx - roi_w / 2)
         y0 = int(cy - roi_h / 2)
         x1 = x0 + roi_w
@@ -467,7 +512,6 @@ def auto_detect_roi(rgb: np.ndarray,
         if y1 > h - margin_y:
             shift = y1 - (h - margin_y)
             y0 -= shift; y1 -= shift
-        # 안전 clamp
         x0 = max(0, x0); y0 = max(0, y0)
         x1 = min(w, x1); y1 = min(h, y1)
         if x1 <= x0 + 1 or y1 <= y0 + 1:
