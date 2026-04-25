@@ -364,12 +364,12 @@ def roi_to_mask(shape, roi):
 #  자동 ROI 추정 — HfS₂ 시편 vs 흰 종이 분리
 # ══════════════════════════════════════════════
 def auto_detect_roi(rgb: np.ndarray,
-                    margin_ratio: float = 0.10,
+                    margin_ratio: float = 0.25,
                     paper_v_thresh: int = 215,
                     paper_s_thresh: int = 25,
-                    min_area_ratio: float = 0.10,
+                    min_area_ratio: float = 0.08,
                     center_off_ratio: float = 0.20,
-                    paper_inside_ratio: float = 0.05) -> tuple:
+                    paper_inside_ratio: float = 0.03) -> tuple:
     """
     HfS₂ 시편 사진에서 자동 ROI 추정.
 
@@ -445,9 +445,9 @@ def auto_detect_roi(rgb: np.ndarray,
 def evaluate_roi_quality(rgb: np.ndarray, roi: tuple,
                          paper_v_thresh: int = 215,
                          paper_s_thresh: int = 25,
-                         min_area_ratio: float = 0.10,
+                         min_area_ratio: float = 0.08,
                          center_off_ratio: float = 0.20,
-                         paper_inside_ratio: float = 0.05) -> tuple:
+                         paper_inside_ratio: float = 0.03) -> tuple:
     """주어진 ROI 에 대해 품질만 평가 (자동 추정 X — DB 로드 등에 사용).
     Returns (flag, reason) — flag ∈ good / warn_small / warn_off / warn_paper / failed
     """
