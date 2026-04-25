@@ -1271,8 +1271,10 @@ _DB_VERSION = 2   # 스키마 변경 시 증가
 
 def db_init(path: str) -> sqlite3.Connection:
     """DB 파일을 열고 테이블이 없으면 생성"""
-    con = sqlite3.connect(path)
+    con = sqlite3.connect(path, timeout=15.0)
+    con.execute("PRAGMA busy_timeout=15000")
     con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
     con.execute(f"""
         CREATE TABLE IF NOT EXISTS meta (
             key   TEXT PRIMARY KEY,
@@ -4928,41 +4930,40 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
 
         try:
             n = db_save_all(path, self.images)
-            # 평가 대상 이미지도 함께 저장 (다중 target)
+            # 평가 대상 + backup 정리를 단일 connection 으로 통합
+            # (연속 connect 시 SQLite WAL lock 충돌 방지)
             eval_note = ""
-            if self._pred_targets:
-                import sqlite3 as _sq, pickle as _pk, json as _js
-                con = _sq.connect(path)
-                _migrate_eval_target_schema(con)
-                con.execute("DELETE FROM eval_target")
-                for t in self._pred_targets:
-                    rgb = t.get("rgb")
-                    if rgb is None:
-                        continue
-                    roi_str = _js.dumps(
-                        list(t["roi"]) if t.get("roi") else None)
-                    blob = _pk.dumps(rgb)
-                    con.execute(
-                        "INSERT INTO eval_target VALUES "
-                        "(?,?,?,?,?,?,?,datetime('now','localtime'))",
-                        (int(t.get("tid",0)),
-                         t.get("name",""),
-                         blob, roi_str,
-                         t.get("color",""),
-                         t.get("cond_hint",""),
-                         None))   # result_json 은 NULL (numpy 직렬화 X)
-                con.commit(); con.close()
-                eval_note = (f" + {len(self._pred_targets)} "
-                             "evaluation targets")
-            # 마이그레이션 백업 테이블 자동 정리 (저장 정상 완료 시)
+            import sqlite3 as _sq, pickle as _pk, json as _js
+            con = _sq.connect(path, timeout=15.0)
             try:
-                import sqlite3 as _sq2
-                _con2 = _sq2.connect(path)
-                _con2.execute(
-                    "DROP TABLE IF EXISTS eval_target_v1_backup")
-                _con2.commit(); _con2.close()
-            except Exception:
-                pass
+                con.execute("PRAGMA busy_timeout=15000")
+                # 평가 대상 이미지 (다중 target)
+                if self._pred_targets:
+                    _migrate_eval_target_schema(con)
+                    con.execute("DELETE FROM eval_target")
+                    for t in self._pred_targets:
+                        rgb = t.get("rgb")
+                        if rgb is None:
+                            continue
+                        roi_str = _js.dumps(
+                            list(t["roi"]) if t.get("roi") else None)
+                        blob = _pk.dumps(rgb)
+                        con.execute(
+                            "INSERT INTO eval_target VALUES "
+                            "(?,?,?,?,?,?,?,datetime('now','localtime'))",
+                            (int(t.get("tid", 0)),
+                             t.get("name", ""),
+                             blob, roi_str,
+                             t.get("color", ""),
+                             t.get("cond_hint", ""),
+                             None))   # result_json 은 NULL
+                    eval_note = (f" + {len(self._pred_targets)} "
+                                 "evaluation targets")
+                # 마이그레이션 백업 정리 (있으면)
+                con.execute("DROP TABLE IF EXISTS eval_target_v1_backup")
+                con.commit()
+            finally:
+                con.close()
             messagebox.showinfo("Saved",
                 f"Saved {n} images{eval_note} to DB.\n{path}")
             self._set_status(
@@ -5071,37 +5072,34 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         if not path: return
         try:
             import sqlite3 as _sq, pickle as _pk, json as _js
-            con = _sq.connect(path)
-            _migrate_eval_target_schema(con)
-            con.execute("DELETE FROM eval_target")
+            con = _sq.connect(path, timeout=15.0)
             n_saved = 0
-            for t in self._pred_targets:
-                rgb = t.get("rgb")
-                if rgb is None:
-                    continue
-                roi_str = _js.dumps(
-                    list(t["roi"]) if t.get("roi") else None)
-                blob = _pk.dumps(rgb)
-                con.execute(
-                    "INSERT INTO eval_target VALUES "
-                    "(?,?,?,?,?,?,?,datetime('now','localtime'))",
-                    (int(t.get("tid",0)),
-                     t.get("name",""),
-                     blob, roi_str,
-                     t.get("color",""),
-                     t.get("cond_hint",""),
-                     None))
-                n_saved += 1
-            con.commit(); con.close()
-            # 마이그레이션 백업 테이블 자동 정리 (저장 정상 완료 시)
             try:
-                import sqlite3 as _sq2
-                _con2 = _sq2.connect(path)
-                _con2.execute(
-                    "DROP TABLE IF EXISTS eval_target_v1_backup")
-                _con2.commit(); _con2.close()
-            except Exception:
-                pass
+                con.execute("PRAGMA busy_timeout=15000")
+                _migrate_eval_target_schema(con)
+                con.execute("DELETE FROM eval_target")
+                for t in self._pred_targets:
+                    rgb = t.get("rgb")
+                    if rgb is None:
+                        continue
+                    roi_str = _js.dumps(
+                        list(t["roi"]) if t.get("roi") else None)
+                    blob = _pk.dumps(rgb)
+                    con.execute(
+                        "INSERT INTO eval_target VALUES "
+                        "(?,?,?,?,?,?,?,datetime('now','localtime'))",
+                        (int(t.get("tid", 0)),
+                         t.get("name", ""),
+                         blob, roi_str,
+                         t.get("color", ""),
+                         t.get("cond_hint", ""),
+                         None))
+                    n_saved += 1
+                # 마이그레이션 백업 정리
+                con.execute("DROP TABLE IF EXISTS eval_target_v1_backup")
+                con.commit()
+            finally:
+                con.close()
             messagebox.showinfo("Saved",
                 f"{n_saved} evaluation target(s) saved.\n{path}")
             self._set_status(
@@ -11372,7 +11370,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                              for img in an if img["cond"]==cond],
                            key=lambda x:df(x[0]))
                 if pts:
-                    xs,ys=zip(*pts)
+                    xs=[df(p[0]) for p in pts]
+                    ys=[p[1] for p in pts]
                     ax.plot(xs,ys,"o-",color=col,lw=lw,ms=ms,label=cond)
                     for x,y in zip(xs,ys):
                         ax.annotate(f"{y:.1f}",(x,y),
@@ -11403,7 +11402,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                      and not np.isnan(img.get("delta_e",np.nan))],
                     key=lambda x:df(x[0]))
                 if pts:
-                    xs,ys=zip(*pts)
+                    xs=[df(p[0]) for p in pts]
+                    ys=[p[1] for p in pts]
                     ax.plot(xs,ys,"^-",color=col,lw=lw,ms=ms,label=cond)
                     for x,y in zip(xs,ys):
                         ax.annotate(f"{y:.1f}",(x,y),
@@ -11426,7 +11426,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                              for img in an if img["cond"]==cond],
                            key=lambda x:df(x[0]))
                 if pts:
-                    xs,ys=zip(*pts)
+                    xs=[df(p[0]) for p in pts]
+                    ys=[p[1] for p in pts]
                     ax.plot(xs,ys,"s-",color=col,lw=lw,ms=ms,label=cond)
                     for x,y in zip(xs,ys):
                         ax.annotate(f"{y:.1f}",(x,y),
@@ -13259,7 +13260,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                              for img in an if img["cond"]==cond],
                            key=lambda x:df(x[0]))
                 if pts:
-                    xs,ys=zip(*pts)
+                    xs=[df(p[0]) for p in pts]
+                    ys=[p[1] for p in pts]
                     ax.plot(xs,ys,"o-",color=col,lw=lw,ms=ms,label=cond)
                     for x,y in zip(xs,ys):
                         ax.annotate(f"{y:.1f}",(x,y),
@@ -13292,7 +13294,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                                 for img in an if img["cond"]==cond],
                                key=lambda x:df(x[0]))
                 if pts_yr:
-                    xs,ys=zip(*pts_yr)
+                    xs=[df(p[0]) for p in pts_yr]
+                    ys=[p[1] for p in pts_yr]
                     ax.plot(xs,ys,"s-",color=col,lw=lw,ms=ms,
                             label=f"{cond} Y%")
                     for x,y in zip(xs,ys):
@@ -13308,7 +13311,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                      and not np.isnan(img.get("yellowness_idx",np.nan))],
                     key=lambda x:df(x[0]))
                 if pts_yi:
-                    xs2,ys2=zip(*pts_yi)
+                    xs2=[df(p[0]) for p in pts_yi]
+                    ys2=[p[1] for p in pts_yi]
                     ax2.plot(xs2,ys2,"^--",color=col,lw=lw,ms=ms,
                              alpha=0.7, label=f"{cond} YI")
                     for x,y in zip(xs2,ys2):
