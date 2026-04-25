@@ -4995,16 +4995,21 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             filetypes=[("HfS2 DB","*.db"),("All","*.*")])
         if not path: return
 
+        # Atomic write: 임시 파일에 저장 후 os.replace 로 교체
+        # → 기존 lock/잔재 파일과 충돌 없음
+        tmp_path = path + ".tmp_save"
+        # 잔재 .tmp_save 정리
+        for ext in ("", "-wal", "-shm", "-journal"):
+            try: os.remove(tmp_path + ext)
+            except OSError: pass
+
         try:
-            n = db_save_all(path, self.images)
+            n = db_save_all(tmp_path, self.images)
             # 평가 대상 + backup 정리를 단일 connection 으로 통합
-            # (연속 connect 시 SQLite WAL lock 충돌 방지)
             eval_note = ""
-            import sqlite3 as _sq, pickle as _pk, json as _js
-            con = _db_open_safe(path)
+            import pickle as _pk, json as _js
+            con = _db_open_safe(tmp_path)
             try:
-                con.execute("PRAGMA busy_timeout=15000")
-                # 평가 대상 이미지 (다중 target)
                 if self._pred_targets:
                     _migrate_eval_target_schema(con)
                     con.execute("DELETE FROM eval_target")
@@ -5023,14 +5028,21 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                              blob, roi_str,
                              t.get("color", ""),
                              t.get("cond_hint", ""),
-                             None))   # result_json 은 NULL
+                             None))
                     eval_note = (f" + {len(self._pred_targets)} "
                                  "evaluation targets")
-                # 마이그레이션 백업 정리 (있으면)
                 con.execute("DROP TABLE IF EXISTS eval_target_v1_backup")
                 con.commit()
             finally:
                 con.close()
+
+            # 기존 path 의 lock 잔재 정리 (있으면)
+            for ext in ("-wal", "-shm", "-journal"):
+                try: os.remove(path + ext)
+                except OSError: pass
+            # Atomic rename (Windows/Linux 모두 atomic)
+            os.replace(tmp_path, path)
+
             unanalyzed = max(0, n - analyzed_n)
             ana_note = (f"  ({analyzed_n} analyzed, {unanalyzed} ROI-only)"
                         if unanalyzed > 0 else "")
@@ -5039,7 +5051,18 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             self._set_status(
                 f"🗄 DB saved — {n} records{ana_note}  ({os.path.basename(path)})")
         except Exception as ex:
-            messagebox.showerror("Save Error", str(ex))
+            # 실패 시 .tmp_save 잔재 정리
+            for ext in ("", "-wal", "-shm", "-journal"):
+                try: os.remove(tmp_path + ext)
+                except OSError: pass
+            err_msg = str(ex)
+            if "locked" in err_msg.lower():
+                err_msg += _L(
+                    "\n\n[해결법] 다른 프로그램(DB Browser 등)이 같은 파일을\n"
+                    "열고 있는지 확인하세요. 또는 다른 경로(C:\\Users\\..)에 저장.",
+                    "\n\n[Fix] Check if DB Browser or other tool has the file open.\n"
+                    "Or save to a different path (e.g. C:\\Users\\..).")
+            messagebox.showerror(_L("저장 실패", "Save Error"), err_msg)
 
     def _db_load(self):
         """이미지 DB 파일 1개 또는 복수 로드 (다중 선택 지원)."""
