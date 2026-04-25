@@ -425,17 +425,17 @@ def _find_straightest_side_midpoint(contour, sx, sy, sbw, sbh):
 def auto_detect_roi(rgb: np.ndarray,
                     paper_v_thresh: int = 215,
                     paper_s_thresh: int = 25,
-                    target_area_ratio: float = 0.16,
+                    target_area_ratio: float = 0.13,
                     max_specimen_fraction: float = 0.70,
                     edge_margin_ratio: float = 0.05,
                     bias_ratio: float = 0.22,
-                    min_area_ratio: float = 0.04,
+                    min_area_ratio: float = 0.03,
                     paper_inside_ratio: float = 0.02) -> tuple:
     """
     HfS₂ 시편 사진에서 자동 ROI 추정.
 
     DB pkw_1.db 의 사용자 패턴 + 사용자 추가 요구:
-      - ROI 면적 ≈ 이미지의 16% (DB 23.8% 보다 약 30% 작게)
+      - ROI 면적 ≈ 이미지의 13% (DB 23.8% 보다 약 45% 작게)
       - ROI 중심 ≈ 시편 bbox 중심에서 **곡률이 가장 낮은(직선에 가까운) 쪽**
         의 중점 방향으로 22% 이동
       - 가로/세로 비 = 시편 bbox 비율
