@@ -93,6 +93,9 @@ TF  = ("Segoe UI", 10, "bold")
 
 COND_COLORS = ["#3b82f6","#16a34a","#d97706","#7c3aed",
                "#dc2626","#0d9488","#b45309","#db2777"]
+EXTRA_TARGET_COLORS = ["#0ea5e9", "#f97316", "#ec4899", "#14b8a6"]
+TARGET_COLOR_PALETTE = COND_COLORS + EXTRA_TARGET_COLORS
+PRED_MAX_TARGETS = 8
 _IMG_EXTS = {".png",".jpg",".jpeg",".bmp",".tiff",".tif"}
 
 # ══════════════════════════════════════════════
@@ -1204,6 +1207,58 @@ def _blob_to_rgb(blob: bytes) -> np.ndarray:
     return np.array(Image.open(io.BytesIO(blob)).convert("RGB"))
 
 
+def _migrate_eval_target_schema(con):
+    """eval_target 테이블 마이그레이션.
+
+    구 스키마: (id INTEGER PRIMARY KEY, rgb_blob BLOB, roi TEXT, saved_at TEXT)
+    신 스키마: (target_id INTEGER PRIMARY KEY, name TEXT, rgb_blob BLOB,
+               roi TEXT, color TEXT, cond_hint TEXT, result_json TEXT,
+               saved_at TEXT)
+
+    Returns: 'created' | 'already_migrated' | 'migrated_with_backup'
+    """
+    cur = con.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='eval_target'")
+    if not cur.fetchone():
+        con.execute(
+            "CREATE TABLE eval_target ("
+            "target_id INTEGER PRIMARY KEY, "
+            "name TEXT, rgb_blob BLOB, roi TEXT, "
+            "color TEXT, cond_hint TEXT, "
+            "result_json TEXT, saved_at TEXT)")
+        con.commit()
+        return "created"
+    cols = {row[1]
+            for row in con.execute("PRAGMA table_info(eval_target)")}
+    if {"target_id", "name", "color"}.issubset(cols):
+        return "already_migrated"
+    # 백업 + 재구성
+    con.execute("ALTER TABLE eval_target RENAME TO eval_target_v1_backup")
+    con.execute(
+        "CREATE TABLE eval_target ("
+        "target_id INTEGER PRIMARY KEY, "
+        "name TEXT, rgb_blob BLOB, roi TEXT, "
+        "color TEXT, cond_hint TEXT, "
+        "result_json TEXT, saved_at TEXT)")
+    # 기존 단일 row 를 첫 target 으로 복사
+    try:
+        rows = list(con.execute(
+            "SELECT rgb_blob, roi, saved_at FROM eval_target_v1_backup"))
+    except Exception:
+        rows = []
+    for i, row in enumerate(rows[:1], start=1):
+        blob = row[0]
+        roi  = row[1] if len(row) > 1 else None
+        saved_at = row[2] if len(row) > 2 else None
+        con.execute(
+            "INSERT INTO eval_target VALUES (?,?,?,?,?,?,?,?)",
+            (i, f"Target #{i}", blob, roi,
+             COND_COLORS[0], "", None, saved_at))
+    con.commit()
+    return "migrated_with_backup"
+
+
 def db_save_all(path: str, images: list) -> int:
     """
     분석 완료 이미지들을 DB에 저장 (upsert: name+cond+day 기준).
@@ -1702,6 +1757,13 @@ class App(_Base):
         self.ch_var   = tk.StringVar(value="S")
         self._refs    = {}
 
+        # ── 다중 평가 대상 (Evaluation 탭) ──────────
+        # 각 target dict 형식:
+        #   {tid, name, rgb, roi, roi_flag, roi_reason, roi_source,
+        #    color, thumb, cond_hint, result}
+        self._pred_targets: list = []
+        self._pred_sel_tid = None
+
         # ── 사용자 설정 임계값 ──────────────────────
         # 황색 판정 (HSI)
         self.cfg_h_lo    = tk.DoubleVar(value=35.0)   # H 하한 (°)
@@ -1739,6 +1801,49 @@ class App(_Base):
         self._build()
         self.bind_all("<Control-v>", lambda e: self._paste())
         self.bind_all("<Control-V>", lambda e: self._paste())
+
+    # ─────────────────────────────────────────
+    #  다중 평가 대상 — property getter (READ only)
+    # ─────────────────────────────────────────
+    @property
+    def _pred_rgb(self):
+        """호환용 — 첫 target 의 rgb 반환. setter 정의 없음."""
+        if self._pred_targets:
+            return self._pred_targets[0].get("rgb")
+        return None
+
+    @property
+    def _pred_roi(self):
+        """호환용 — 첫 target 의 roi 반환. setter 정의 없음."""
+        if self._pred_targets:
+            return self._pred_targets[0].get("roi")
+        return None
+
+    # ─────────────────────────────────────────
+    #  헬퍼
+    # ─────────────────────────────────────────
+    def _pred_max_tid(self) -> int:
+        """현재 사용 중인 최대 tid 반환 (없으면 0)"""
+        if not self._pred_targets:
+            return 0
+        return max(int(t.get("tid", 0)) for t in self._pred_targets)
+
+    def _pred_get_target_by_tid(self, tid):
+        """tid 로 target 검색 (없으면 None)"""
+        for t in self._pred_targets:
+            if t.get("tid") == tid:
+                return t
+        return None
+
+    def _pred_assign_color(self) -> str:
+        """현재 사용 중이 아닌 첫 빈 색상 반환"""
+        used = {t.get("color") for t in self._pred_targets}
+        for c in TARGET_COLOR_PALETTE:
+            if c not in used:
+                return c
+        # 팔레트 다 쓰면 인덱스로 fallback
+        return TARGET_COLOR_PALETTE[len(self._pred_targets)
+                                    % len(TARGET_COLOR_PALETTE)]
 
     # ─────────────────────────────────────────
     #  UI
@@ -4717,24 +4822,32 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
 
         try:
             n = db_save_all(path, self.images)
-            # 평가 대상 이미지도 함께 저장
+            # 평가 대상 이미지도 함께 저장 (다중 target)
             eval_note = ""
-            if self._pred_rgb is not None:
+            if self._pred_targets:
                 import sqlite3 as _sq, pickle as _pk, json as _js
                 con = _sq.connect(path)
-                con.execute("""CREATE TABLE IF NOT EXISTS eval_target
-                    (id INTEGER PRIMARY KEY, rgb_blob BLOB,
-                     roi TEXT, saved_at TEXT)""")
-                roi_str = _js.dumps(
-                    list(self._pred_roi) if self._pred_roi else None)
-                blob = _pk.dumps(self._pred_rgb)
+                _migrate_eval_target_schema(con)
                 con.execute("DELETE FROM eval_target")
-                con.execute(
-                    "INSERT INTO eval_target VALUES"
-                    " (1,?,?,datetime('now','localtime'))",
-                    (blob, roi_str))
+                for t in self._pred_targets:
+                    rgb = t.get("rgb")
+                    if rgb is None:
+                        continue
+                    roi_str = _js.dumps(
+                        list(t["roi"]) if t.get("roi") else None)
+                    blob = _pk.dumps(rgb)
+                    con.execute(
+                        "INSERT INTO eval_target VALUES "
+                        "(?,?,?,?,?,?,?,datetime('now','localtime'))",
+                        (int(t.get("tid",0)),
+                         t.get("name",""),
+                         blob, roi_str,
+                         t.get("color",""),
+                         t.get("cond_hint",""),
+                         None))   # result_json 은 NULL (numpy 직렬화 X)
                 con.commit(); con.close()
-                eval_note = " + evaluation target"
+                eval_note = (f" + {len(self._pred_targets)} "
+                             "evaluation targets")
             messagebox.showinfo("Saved",
                 f"Saved {n} images{eval_note} to DB.\n{path}")
             self._set_status(
@@ -4781,26 +4894,27 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 self.sel_idx = 0
             self._rebuild_list()
 
-            # 평가 대상 이미지 복원
+            # 평가 대상 이미지 복원 (다중 target)
             eval_note = ""
             try:
                 import sqlite3 as _sq, pickle as _pk, json as _js
                 con = _sq.connect(path)
-                row = con.execute(
-                    "SELECT rgb_blob, roi FROM eval_target LIMIT 1"
-                ).fetchone()
+                # 테이블 존재 확인
+                cur = con.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='eval_target'")
+                if cur.fetchone():
+                    _migrate_eval_target_schema(con)
+                    rows = list(con.execute(
+                        "SELECT target_id, name, rgb_blob, roi, "
+                        "color, cond_hint "
+                        "FROM eval_target ORDER BY target_id"))
+                    n_loaded = self._pred_load_rows(rows)
+                    if n_loaded > 0:
+                        eval_note = (f"\n+ {n_loaded} evaluation "
+                                     "target(s) restored.")
+                        self.after(150, self._pred_rebuild_cards)
                 con.close()
-                if row:
-                    self._pred_rgb = _pk.loads(row[0])
-                    roi_data = _js.loads(row[1]) if row[1] else None
-                    self._pred_roi = tuple(roi_data) if roi_data else None
-                    if hasattr(self, "_pred_roi_info"):
-                        self._pred_roi_info.set(
-                            f"✔ ROI {self._pred_roi[2]-self._pred_roi[0]}"
-                            f"x{self._pred_roi[3]-self._pred_roi[1]}px"
-                            if self._pred_roi else "No ROI selected")
-                    self.after(150, self._pred_draw_preview)
-                    eval_note = "\n+ Evaluation target image restored."
             except Exception:
                 pass  # eval_target 테이블 없으면 무시
 
@@ -4830,10 +4944,10 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 "Save a target first using [💾 Save Target].")
 
     def _db_save_target(self):
-        """평가 대상 이미지 별도 저장"""
-        if self._pred_rgb is None:
+        """평가 대상 이미지 별도 저장 (다중 target)"""
+        if not self._pred_targets:
             messagebox.showwarning("Warning",
-                "No evaluation target image loaded.\nLoad an image in the [🎯 Evaluation] tab first.")
+                "No evaluation target loaded.\nAdd targets in the [🎯 Evaluation] tab first.")
             return
         path = filedialog.asksaveasfilename(
             title="Save Evaluation Target",
@@ -4843,46 +4957,116 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         try:
             import sqlite3 as _sq, pickle as _pk, json as _js
             con = _sq.connect(path)
-            con.execute("""CREATE TABLE IF NOT EXISTS eval_target
-                (id INTEGER PRIMARY KEY, rgb_blob BLOB,
-                 roi TEXT, saved_at TEXT)""")
-            roi_str = _js.dumps(
-                list(self._pred_roi) if self._pred_roi else None)
-            blob = _pk.dumps(self._pred_rgb)
+            _migrate_eval_target_schema(con)
             con.execute("DELETE FROM eval_target")
-            con.execute(
-                "INSERT INTO eval_target VALUES"
-                " (1,?,?,datetime('now','localtime'))",
-                (blob, roi_str))
+            n_saved = 0
+            for t in self._pred_targets:
+                rgb = t.get("rgb")
+                if rgb is None:
+                    continue
+                roi_str = _js.dumps(
+                    list(t["roi"]) if t.get("roi") else None)
+                blob = _pk.dumps(rgb)
+                con.execute(
+                    "INSERT INTO eval_target VALUES "
+                    "(?,?,?,?,?,?,?,datetime('now','localtime'))",
+                    (int(t.get("tid",0)),
+                     t.get("name",""),
+                     blob, roi_str,
+                     t.get("color",""),
+                     t.get("cond_hint",""),
+                     None))
+                n_saved += 1
             con.commit(); con.close()
-            h, w = self._pred_rgb.shape[:2]
-            roi_note = (f"  ROI: {self._pred_roi}"
-                        if self._pred_roi else "  ROI: (none)")
             messagebox.showinfo("Saved",
-                f"Evaluation target saved.\n  Size: {w}×{h}px\n{roi_note}\n{path}")
-            self._set_status(f"🎯 Target saved: {os.path.basename(path)}")
+                f"{n_saved} evaluation target(s) saved.\n{path}")
+            self._set_status(
+                f"🎯 {n_saved} target(s) saved: {os.path.basename(path)}")
         except Exception as ex:
             messagebox.showerror("Save Error", str(ex))
 
+    def _pred_load_rows(self, rows) -> int:
+        """eval_target 행 리스트 → self._pred_targets 적재.
+
+        rows 의 각 row 는 (target_id, name, rgb_blob, roi, color, cond_hint).
+        Returns: 적재된 개수
+        """
+        import pickle as _pk, json as _js
+        n_loaded = 0
+        # 기존 target 제거
+        self._pred_targets.clear()
+        self._pred_sel_tid = None
+        for row in rows[:PRED_MAX_TARGETS]:
+            try:
+                tid = int(row[0]) if row[0] is not None else (n_loaded+1)
+                name = row[1] or f"Target #{tid}"
+                blob = row[2]
+                roi_data = _js.loads(row[3]) if row[3] else None
+                roi = tuple(roi_data) if roi_data else None
+                color = row[4] or self._pred_assign_color()
+                cond_hint = row[5] or ""
+                rgb = _pk.loads(blob)
+                # ROI 품질 평가
+                if roi is not None:
+                    try:
+                        flag, reason = evaluate_roi_quality(rgb, roi)
+                    except Exception:
+                        flag, reason = "manual", "DB 로드"
+                else:
+                    # ROI 없으면 자동 추정
+                    try:
+                        roi, flag, reason = auto_detect_roi(rgb)
+                    except Exception:
+                        h, w = rgb.shape[:2]
+                        roi = (w//4, h//4, 3*w//4, 3*h//4)
+                        flag = "failed"
+                        reason = "auto_detect_roi 실패"
+                try:
+                    thumb = make_thumb(rgb, 90, 70, roi)
+                except Exception:
+                    thumb = None
+                self._pred_targets.append({
+                    "tid":   tid,
+                    "name":  name,
+                    "rgb":   rgb,
+                    "roi":   roi,
+                    "roi_flag":   flag,
+                    "roi_reason": f"DB 로드: {reason}",
+                    "roi_source": "db",
+                    "color": color,
+                    "thumb": thumb,
+                    "cond_hint": cond_hint,
+                    "result": None,
+                })
+                n_loaded += 1
+            except Exception:
+                continue
+        if self._pred_targets:
+            self._pred_sel_tid = self._pred_targets[0]["tid"]
+        return n_loaded
+
     def _db_load_target(self, path: str):
-        """평가 대상 이미지 로드 (내부 공용)"""
+        """평가 대상 이미지 로드 (내부 공용 — 다중 target)"""
         try:
-            import sqlite3 as _sq, pickle as _pk, json as _js
+            import sqlite3 as _sq
             con = _sq.connect(path)
-            row = con.execute(
-                "SELECT rgb_blob, roi FROM eval_target LIMIT 1"
-            ).fetchone()
+            cur = con.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='eval_target'")
+            if not cur.fetchone():
+                con.close()
+                return False
+            _migrate_eval_target_schema(con)
+            rows = list(con.execute(
+                "SELECT target_id, name, rgb_blob, roi, "
+                "color, cond_hint "
+                "FROM eval_target ORDER BY target_id"))
             con.close()
-            if row:
-                self._pred_rgb = _pk.loads(row[0])
-                roi_data = _js.loads(row[1]) if row[1] else None
-                self._pred_roi = tuple(roi_data) if roi_data else None
-                if hasattr(self, "_pred_roi_info"):
-                    self._pred_roi_info.set(
-                        f"✔ ROI {self._pred_roi[2]-self._pred_roi[0]}"
-                        f"x{self._pred_roi[3]-self._pred_roi[1]}px"
-                        if self._pred_roi else "No ROI selected")
-                self.after(150, self._pred_draw_preview)
+            if not rows:
+                return False
+            n = self._pred_load_rows(rows)
+            if n > 0:
+                self.after(150, self._pred_rebuild_cards)
                 return True
         except Exception:
             pass
@@ -4994,7 +5178,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         f = self._tfs["predict"]
 
         # ══════════════════════════════════
-        # 좌: 평가 대상 입력 패널 (고정 폭)
+        # 좌: 평가 대상 입력 패널 (다중 target 카드 리스트)
         # ══════════════════════════════════
         left = tk.Frame(f, bg=PANEL,
                         highlightbackground=BORDER, highlightthickness=1,
@@ -5002,63 +5186,103 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         left.pack(side="left", fill="y", padx=(0,4))
         left.pack_propagate(False)
 
-        # 헤더
-        tk.Label(left,
-                 text="  🎯 Evaluation Target",
-                 bg=PANEL2, fg=TXT, font=MFB,
-                 highlightbackground=BORDER,
-                 highlightthickness=1).pack(fill="x")
-        tk.Label(left,
-                 text="  Input a target image to estimate\n"
-                      "  oxidation date & Raman spectrum.",
-                 bg=PANEL, fg=SUB, font=("Segoe UI",7),
-                 justify="left").pack(anchor="w", padx=8, pady=(4,0))
+        # 헤더 (N/8 표시)
+        hdr_row = tk.Frame(left, bg=PANEL2,
+                           highlightbackground=BORDER,
+                           highlightthickness=1)
+        hdr_row.pack(fill="x")
+        tk.Label(hdr_row,
+                 text=_L("  🎯 평가대상", "  🎯 Evaluation Targets"),
+                 bg=PANEL2, fg=TXT, font=MFB).pack(side="left", pady=4)
+        self._pred_count_var = tk.StringVar(value="0/8")
+        tk.Label(hdr_row, textvariable=self._pred_count_var,
+                 bg=PANEL2, fg=ACCENT, font=MFB).pack(side="right", padx=8)
 
-        # 이미지 로드
-        inp = tk.Frame(left, bg=PANEL)
-        inp.pack(fill="x", padx=8, pady=6)
-        tk.Button(inp, text="📂 Select Image",
-                  command=self._pred_load_image,
-                  bg=ACCENT, fg="white", font=MF,
-                  relief="flat", padx=10, pady=5,
-                  cursor="hand2").pack(fill="x", pady=2)
-        tk.Button(inp, text="📋 From Clipboard",
+        # 안내 박스
+        guide = tk.Frame(left, bg=CARD,
+                         highlightbackground=BORDER,
+                         highlightthickness=1)
+        guide.pack(fill="x", padx=6, pady=(4,2))
+        tk.Label(guide,
+                 text=_L(
+                    "1. 평가대상 이미지 추가 (드래그앤드롭 OK,\n"
+                    "   최대 8개)\n"
+                    "2. 카드 테두리 색으로 ROI 품질 확인\n"
+                    "   🟢 OK   🟠 검토   🔴 실패\n"
+                    "3. ▶ 모두 분석 → 모든 target 동시 분석\n"
+                    "4. 카드 클릭 = 선택 (Top-3 후보 갱신)",
+                    "1. Add target images (drag&drop OK,\n"
+                    "   max 8)\n"
+                    "2. Border color = ROI quality\n"
+                    "   🟢 OK   🟠 review   🔴 failed\n"
+                    "3. ▶ Run All → analyze all targets\n"
+                    "4. Click card = select (Top-3 update)"),
+                 bg=CARD, fg=SUB, font=("Segoe UI",7),
+                 justify="left").pack(anchor="w", padx=6, pady=4)
+
+        # 액션 버튼 행
+        btn_row = tk.Frame(left, bg=PANEL)
+        btn_row.pack(fill="x", padx=6, pady=(2,2))
+        self._pred_add_btn = tk.Button(
+            btn_row, text=_L("➕ 추가", "➕ Add"),
+            command=self._pred_load_image,
+            bg=ACCENT, fg="white", font=MF,
+            relief="flat", padx=8, pady=4,
+            cursor="hand2")
+        self._pred_add_btn.pack(side="left", expand=True,
+                                fill="x", padx=(0,2))
+        tk.Button(btn_row, text=_L("📋 붙여넣기", "📋 Paste"),
                   command=self._pred_paste_image,
                   bg=BTN, fg=TXT, font=MF,
-                  relief="flat", padx=10, pady=4,
-                  cursor="hand2").pack(fill="x", pady=2)
-
-        # Save / Load Target 버튼 행
-        tgt_row = tk.Frame(inp, bg=PANEL)
-        tgt_row.pack(fill="x", pady=(2,0))
-        tk.Button(tgt_row, text="💾 Save Target",
-                  command=self._db_save_target,
-                  bg=BTN, fg=TXT, font=LF,
-                  relief="flat", padx=6, pady=3,
-                  cursor="hand2").pack(side="left", expand=True,
-                                       fill="x", padx=(0,2))
-        tk.Button(tgt_row, text="📂 Load Target",
-                  command=self._pred_load_target_dialog,
-                  bg=BTN, fg=TXT, font=LF,
-                  relief="flat", padx=6, pady=3,
+                  relief="flat", padx=6, pady=4,
                   cursor="hand2").pack(side="left", expand=True,
                                        fill="x", padx=(2,0))
 
-        tk.Frame(left, bg=BORDER, height=1).pack(fill="x", padx=8, pady=4)
+        # ▶ 모두 분석
+        tk.Button(left, text=_L("▶  모두 분석", "▶  Run All"),
+                  command=self._pred_run_all,
+                  bg=ACCENT, fg="white",
+                  font=("Segoe UI",10,"bold"),
+                  relief="flat", pady=8, cursor="hand2").pack(
+                  fill="x", padx=6, pady=(2,2))
 
-        # 조건 입력
-        tk.Label(left, text="  Condition (optional filter)",
-                 bg=PANEL, fg=SUB, font=MFB).pack(anchor="w", padx=8, pady=(0,2))
-        cf = tk.Frame(left, bg=PANEL)
-        cf.pack(fill="x", padx=8)
+        # 🗑 전체 삭제 + Save/Load
+        sub_row = tk.Frame(left, bg=PANEL)
+        sub_row.pack(fill="x", padx=6, pady=(0,2))
+        tk.Button(sub_row, text=_L("🗑 전체삭제","🗑 Clear All"),
+                  command=self._pred_clear_all_targets,
+                  bg=BTN, fg=RED, font=LF,
+                  relief="flat", padx=4, pady=2,
+                  cursor="hand2").pack(side="left", expand=True,
+                                       fill="x", padx=(0,1))
+        tk.Button(sub_row, text="💾",
+                  command=self._db_save_target,
+                  bg=BTN, fg=TXT, font=LF,
+                  relief="flat", padx=4, pady=2,
+                  cursor="hand2").pack(side="left", padx=1)
+        tk.Button(sub_row, text="📂",
+                  command=self._pred_load_target_dialog,
+                  bg=BTN, fg=TXT, font=LF,
+                  relief="flat", padx=4, pady=2,
+                  cursor="hand2").pack(side="left", padx=1)
+
+        tk.Frame(left, bg=BORDER, height=1).pack(fill="x", padx=8, pady=2)
+
+        # 조건 힌트 (입력 시 모든 신규 target 의 cond_hint 기본값)
+        cond_lbl = tk.Frame(left, bg=PANEL)
+        cond_lbl.pack(fill="x", padx=6, pady=(0,1))
+        tk.Label(cond_lbl, text=_L("Cond hint:","Cond hint:"),
+                 bg=PANEL, fg=SUB, font=("Segoe UI",7)).pack(side="left")
         self._pred_cond_var = tk.StringVar()
-        tk.Entry(cf, textvariable=self._pred_cond_var,
-                 bg=PANEL2, fg=TXT, font=MF,
+        tk.Entry(cond_lbl, textvariable=self._pred_cond_var,
+                 bg=PANEL2, fg=TXT, font=("Segoe UI",7),
                  insertbackground=TXT, relief="flat",
                  highlightbackground=BORDER,
-                 highlightthickness=1).pack(fill="x", pady=2)
-        pf4 = tk.Frame(cf, bg=PANEL)
-        pf4.pack(fill="x", pady=(2,4))
+                 highlightthickness=1, width=20).pack(
+            side="left", fill="x", expand=True, padx=2)
+
+        pf4 = tk.Frame(left, bg=PANEL)
+        pf4.pack(fill="x", padx=6, pady=(0,2))
         for lbl2, col in self._presets:
             tk.Button(pf4, text=lbl2.replace("Native-","N-"),
                       command=lambda l=lbl2: self._pred_cond_var.set(l),
@@ -5067,31 +5291,10 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                       relief="flat", cursor="hand2",
                       padx=2, pady=1).pack(side="left", padx=1)
 
-        tk.Frame(left, bg=BORDER, height=1).pack(fill="x", padx=8, pady=4)
+        tk.Frame(left, bg=BORDER, height=1).pack(fill="x", padx=8, pady=2)
 
-        # ROI 설정
-        tk.Label(left, text="  ROI Setup",
-                 bg=PANEL, fg=SUB, font=MFB).pack(anchor="w", padx=8, pady=(0,2))
-        self._pred_roi_info = tk.StringVar(value="No ROI selected")
-        tk.Label(left, textvariable=self._pred_roi_info,
-                 bg=PANEL, fg=AMBER, font=LF).pack(anchor="w", padx=10)
-        rf = tk.Frame(left, bg=PANEL)
-        rf.pack(fill="x", padx=8, pady=4)
-        tk.Button(rf, text="🎯 Set ROI",
-                  command=self._pred_open_roi,
-                  bg=TEAL, fg="white", font=MF,
-                  relief="flat", padx=8, pady=4,
-                  cursor="hand2").pack(side="left", padx=(0,4))
-        tk.Button(rf, text="↺ Reset",
-                  command=self._pred_clear_roi,
-                  bg=BTN, fg=RED, font=MF,
-                  relief="flat", padx=8, pady=4,
-                  cursor="hand2").pack(side="left")
-
-        tk.Frame(left, bg=BORDER, height=1).pack(fill="x", padx=8, pady=4)
-
-        # ── Raman 피크 처리 조건 ──────────────────────
-        tk.Label(left, text="  Raman Peak Extraction",
+        # ── Raman 피크 처리 조건 (기존 유지) ─────────
+        tk.Label(left, text=_L("  Raman 피크 추출","  Raman Peak Extraction"),
                  bg=PANEL, fg=SUB, font=MFB).pack(anchor="w", padx=8, pady=(0,2))
 
         pk_f = tk.Frame(left, bg=PANEL)
@@ -5129,44 +5332,39 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
 
         tk.Frame(left, bg=BORDER, height=1).pack(fill="x", padx=8, pady=4)
 
-        # 실행 버튼
-        tk.Button(left, text="▶  Run Evaluation",
-                  command=self._run_predict,
-                  bg=ACCENT, fg="white",
-                  font=("Segoe UI",10,"bold"),
-                  relief="flat", pady=8, cursor="hand2").pack(
-                  fill="x", padx=8, pady=4)
+        # ── 카드 스크롤 영역 ─────────────────────────
+        sc = tk.Frame(left, bg=PANEL)
+        sc.pack(fill="both", expand=True, padx=4, pady=2)
+        self._pred_lc = tk.Canvas(sc, bg=PANEL, highlightthickness=0)
+        vsb = tk.Scrollbar(sc, orient="vertical",
+                           command=self._pred_lc.yview)
+        self._pred_lc.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._pred_lc.pack(fill="both", expand=True)
+        self._pred_lf = tk.Frame(self._pred_lc, bg=PANEL)
+        _pw = self._pred_lc.create_window((0,0),
+                                          window=self._pred_lf,
+                                          anchor="nw")
+        self._pred_lf.bind("<Configure>",
+            lambda e: self._pred_lc.configure(
+                scrollregion=self._pred_lc.bbox("all")))
+        self._pred_lc.bind("<Configure>",
+            lambda e: self._pred_lc.itemconfig(_pw, width=e.width))
 
-        # 이미지 미리보기 (DnD)
-        prev_hdr = tk.Frame(left, bg=PANEL)
-        prev_hdr.pack(fill="x", padx=8, pady=(6,2))
-        tk.Label(prev_hdr, text="  Preview",
-                 bg=PANEL, fg=SUB, font=MFB).pack(side="left")
+        # 카드 패널 자체 DnD 등록
         if _DND:
-            tk.Label(prev_hdr,
-                     text="  (drag & drop here)",
-                     bg=PANEL, fg=TEAL,
-                     font=("Segoe UI",7)).pack(side="left")
+            try:
+                self._pred_lc.drop_target_register(DND_FILES)
+                self._pred_lc.dnd_bind("<<Drop>>", self._pred_on_drop)
+                self._pred_lf.drop_target_register(DND_FILES)
+                self._pred_lf.dnd_bind("<<Drop>>", self._pred_on_drop)
+            except Exception:
+                pass
 
-        self._pred_cv = tk.Canvas(
-            left, bg=CARD2,
-            highlightbackground=TEAL if _DND else BORDER,
-            highlightthickness=2)
-        self._pred_cv.pack(fill="both", expand=True,
-                           padx=8, pady=(0,8))
-        self._pred_cv.create_text(
-            150, 80,
-            text="📂 Drag image here\nor use button above",
-            fill=SUB, font=("Segoe UI",8),
-            justify="center")
-        self._pred_cv.bind("<Configure>", lambda e: self._pred_draw_preview())
-        if _DND:
-            self._pred_cv.drop_target_register(DND_FILES)
-            self._pred_cv.dnd_bind("<<Drop>>",    self._pred_on_drop)
-            self._pred_cv.dnd_bind("<<DragEnter>>",
-                lambda e: self._pred_cv.configure(bg=PANEL2))
-            self._pred_cv.dnd_bind("<<DragLeave>>",
-                lambda e: self._pred_cv.configure(bg=CARD2))
+        # 호환용: 기존 코드가 _pred_cv / _pred_roi_info 를 참조해도 안 깨지도록
+        # 더미 객체 유지 (실제로는 카드 패널이 미리보기 역할)
+        self._pred_cv = self._pred_lc
+        self._pred_roi_info = tk.StringVar(value="No ROI selected")
 
         # ══════════════════════════════════
         # 우: PanedWindow — 결과 영역 (수직)
@@ -5445,152 +5643,581 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             lambda e: self._copy_text(self._pred_comment))
 
         # 내부 상태
-        self._pred_rgb = None
-        self._pred_roi = None
         self._last_eval_ctx = None   # 차트 팝업 재렌더용
 
+        # 초기 카드 빌드
+        self._pred_rebuild_cards()
+
+
+    # ─────────────────────────────────────────
+    #  다중 평가 대상 — 핵심 메서드
+    # ─────────────────────────────────────────
+    def _pred_add_target(self, pil_img, name: str = "Target"):
+        """평가대상 이미지 추가. 8개 도달 시 경고."""
+        if len(self._pred_targets) >= PRED_MAX_TARGETS:
+            messagebox.showwarning(
+                _L("주의","Warning"),
+                _L(f"평가대상은 최대 {PRED_MAX_TARGETS}개까지만 추가 가능합니다.",
+                   f"Maximum {PRED_MAX_TARGETS} targets allowed."))
+            return None
+        try:
+            pil_rgb = pil_img.convert("RGB")
+            rgb = np.array(pil_rgb)
+        except Exception as ex:
+            messagebox.showerror(_L("오류","Error"), str(ex))
+            return None
+
+        # 자동 ROI 추정
+        try:
+            auto_roi, roi_flag, roi_reason = auto_detect_roi(rgb)
+        except Exception as ex:
+            h, w = rgb.shape[:2]
+            auto_roi = (w//4, h//4, 3*w//4, 3*h//4)
+            roi_flag = "failed"
+            roi_reason = f"auto_detect_roi 실패: {ex}"
+
+        tid = self._pred_max_tid() + 1
+        color = self._pred_assign_color()
+        cond_hint = (self._pred_cond_var.get().strip()
+                     if hasattr(self, "_pred_cond_var") else "")
+        try:
+            thumb = make_thumb(rgb, 90, 70, auto_roi)
+        except Exception:
+            thumb = None
+
+        target = {
+            "tid":         tid,
+            "name":        (name or f"Target #{tid}")[:64],
+            "rgb":         rgb,
+            "roi":         auto_roi,
+            "roi_flag":    roi_flag,
+            "roi_reason":  roi_reason,
+            "roi_source":  "auto",
+            "color":       color,
+            "thumb":       thumb,
+            "cond_hint":   cond_hint,
+            "result":      None,
+        }
+        self._pred_targets.append(target)
+
+        # 첫 추가 시 자동 선택
+        if self._pred_sel_tid is None:
+            self._pred_sel_tid = tid
+
+        self._pred_rebuild_cards()
+        self._set_status(
+            _L(f"✓ 평가대상 추가: {target['name']}  ({len(self._pred_targets)}/{PRED_MAX_TARGETS})",
+               f"✓ Target added: {target['name']}  ({len(self._pred_targets)}/{PRED_MAX_TARGETS})"))
+        return target
+
+    def _pred_remove_target(self, tid):
+        """tid 의 target 삭제."""
+        before = len(self._pred_targets)
+        self._pred_targets = [t for t in self._pred_targets
+                              if t.get("tid") != tid]
+        if before == len(self._pred_targets):
+            return
+        if self._pred_sel_tid == tid:
+            self._pred_sel_tid = (self._pred_targets[0]["tid"]
+                                  if self._pred_targets else None)
+        # Advanced 탭 stale 방지 (이전 target 의 _last_eval_ctx 무효화)
+        self._last_eval_ctx = None
+        self._pred_rebuild_cards()
+        # 차트도 갱신 시도
+        try:
+            self._pred_draw_all_charts()
+        except Exception:
+            pass
+
+    def _pred_clear_all_targets(self):
+        """모든 target 삭제 (확인 후)."""
+        if not self._pred_targets:
+            return
+        if not messagebox.askyesno(
+                _L("확인","Confirm"),
+                _L("모든 평가대상을 삭제할까요?",
+                   "Delete all evaluation targets?")):
+            return
+        self._pred_targets.clear()
+        self._pred_sel_tid = None
+        # Advanced 탭 stale 방지
+        self._last_eval_ctx = None
+        self._pred_rebuild_cards()
+        try:
+            self._pred_draw_all_charts()
+        except Exception:
+            pass
+        self._set_status(
+            _L("🗑 모든 평가대상 삭제됨", "🗑 All targets cleared"))
+
+    def _pred_replace_first_target(self, rgb: np.ndarray, name: str):
+        """호환용 — 기존 단일 target 흐름 마이그레이션. 첫 target 만 교체."""
+        try:
+            auto_roi, roi_flag, roi_reason = auto_detect_roi(rgb)
+        except Exception:
+            h, w = rgb.shape[:2]
+            auto_roi = (w//4, h//4, 3*w//4, 3*h//4)
+            roi_flag = "failed"
+            roi_reason = "auto_detect_roi 실패"
+        try:
+            thumb = make_thumb(rgb, 90, 70, auto_roi)
+        except Exception:
+            thumb = None
+        if self._pred_targets:
+            t = self._pred_targets[0]
+            t["rgb"] = rgb
+            t["name"] = (name or t.get("name","Target"))[:64]
+            t["roi"] = auto_roi
+            t["roi_flag"] = roi_flag
+            t["roi_reason"] = roi_reason
+            t["roi_source"] = "auto"
+            t["thumb"] = thumb
+            t["result"] = None
+        else:
+            tid = 1
+            t = {
+                "tid": tid, "name": (name or "Target #1")[:64],
+                "rgb": rgb, "roi": auto_roi,
+                "roi_flag": roi_flag, "roi_reason": roi_reason,
+                "roi_source": "auto",
+                "color": self._pred_assign_color(),
+                "thumb": thumb,
+                "cond_hint": (self._pred_cond_var.get().strip()
+                              if hasattr(self, "_pred_cond_var") else ""),
+                "result": None,
+            }
+            self._pred_targets.append(t)
+            self._pred_sel_tid = tid
+        self._pred_rebuild_cards()
+        return t
+
+    def _pred_select(self, tid):
+        """카드 클릭 = 선택. Top-3 후보 + 메인 차트 + Pseudo-Raman + 결과 라벨/코멘트 갱신."""
+        if not any(t.get("tid")==tid for t in self._pred_targets):
+            return
+        self._pred_sel_tid = tid
+        t = self._pred_get_target_by_tid(tid)
+        if t and t.get("result"):
+            try:
+                res = t["result"]
+                self._update_pred_candidates(
+                    res.get("target_metrics",{}),
+                    res.get("top",[]))
+            except Exception:
+                pass
+            # ── 선택된 target 의 결과를 모든 의존 표시에 반영 ──
+            res = t["result"]
+            tm = res.get("target_metrics") or res.get("target")
+            # 메인 차트 (radar + timeline) 갱신
+            try:
+                self._pred_draw_all_charts()
+            except Exception:
+                pass
+            # Pseudo-Raman 회귀/스펙트럼 + ctx 갱신
+            if tm is not None and getattr(self, "_raman_data", None):
+                try:
+                    self._run_pseudo_raman_inline(tm)
+                except Exception:
+                    pass
+            # 결과 요약 라벨 (_pred_run_all 과 동일 포맷)
+            try:
+                if hasattr(self, "_pred_result_var"):
+                    ed   = res.get("est_day")
+                    conf = res.get("confidence", 0)
+                    best = res.get("best_match", "—")
+                    nm   = (t.get("name","?") or "?")[:18]
+                    if ed is not None:
+                        txt = (f"[{nm}] "
+                               f"Day {ed:.1f} (Conf {conf:.0f}%)  "
+                               f"Best={best}")
+                    else:
+                        txt = _L(f"[{nm}] 추정 불가",
+                                 f"[{nm}] cannot estimate")
+                    self._pred_result_var.set(txt)
+            except Exception:
+                pass
+            # 분석 근거 코멘트 (재생성)
+            try:
+                if hasattr(self, "_pred_comment") and tm is not None:
+                    comment = self._generate_comment(
+                        tm, res.get("top", []),
+                        res.get("est_day"),
+                        res.get("confidence", 0),
+                        res.get("cond_input",""),
+                        res.get("pool_cond", []))
+                    self._pred_comment.configure(state="normal")
+                    self._pred_comment.delete("1.0","end")
+                    self._pred_comment.insert("end", comment)
+                    self._pred_comment.configure(state="disabled")
+            except Exception:
+                pass
+        self._pred_rebuild_cards()
 
     def _pred_on_drop(self, event):
-        """미리보기 캔버스로 이미지 드래그앤드롭"""
-        self._pred_cv.configure(highlightbackground=TEAL)
+        """카드 패널 DnD 핸들러."""
         paths = parse_drop_paths(event.data)
         img_paths = [p for p in paths
                      if os.path.splitext(p)[1].lower() in _IMG_EXTS]
         if not img_paths:
-            self._set_status(_L("⚠ 이미지 파일이 아닙니다.","⚠ Not an image file.")); return
-        try:
-            pil = Image.open(img_paths[0]).convert("RGB")
-            self._pred_rgb = np.array(pil)
-            self._pred_roi = None
-            self._pred_roi_info.set(_L("ROI 미선택","No ROI selected"))
-            self._pred_draw_preview()
-            self._set_status(f"Target loaded: {os.path.basename(img_paths[0])}")
-        except Exception as ex:
-            messagebox.showerror(_L("오류","Error"), str(ex))
+            self._set_status(_L("⚠ 이미지 파일이 아닙니다.",
+                                "⚠ Not an image file."))
+            return
+        for p in img_paths:
+            try:
+                self._pred_add_target(Image.open(p),
+                                      os.path.basename(p))
+            except Exception as ex:
+                messagebox.showerror(_L("오류","Error"),
+                                     f"{p}\n{ex}")
 
     def _pred_load_image(self):
-        path = filedialog.askopenfilename(
-            title=_L("분석 대상 이미지","Target Image"),
+        """[➕ 추가] 핸들러 — 다중 파일 선택 가능"""
+        if len(self._pred_targets) >= PRED_MAX_TARGETS:
+            messagebox.showwarning(
+                _L("주의","Warning"),
+                _L(f"평가대상은 최대 {PRED_MAX_TARGETS}개까지만 가능합니다.",
+                   f"Maximum {PRED_MAX_TARGETS} targets allowed."))
+            return
+        paths = filedialog.askopenfilenames(
+            title=_L("평가대상 이미지","Target Images"),
             filetypes=[(_L("이미지","Image"),"*.png *.jpg *.jpeg *.bmp *.tiff"),
                        (_L("전체","All"),"*.*")])
-        if not path: return
-        try:
-            pil = Image.open(path).convert("RGB")
-            self._pred_rgb = np.array(pil)
-            self._pred_roi = None
-            self._pred_roi_info.set(_L("ROI 미선택","No ROI selected"))
-            self._pred_draw_preview()
-            self._set_status(_L(f"분석 대상 로드: {os.path.basename(path)}", f"Target loaded: {os.path.basename(path)}"))
-        except Exception as ex:
-            messagebox.showerror(_L("오류","Error"), str(ex))
+        if not paths:
+            return
+        for path in paths:
+            try:
+                self._pred_add_target(Image.open(path),
+                                      os.path.basename(path))
+            except Exception as ex:
+                messagebox.showerror(_L("오류","Error"), str(ex))
 
     def _pred_paste_image(self):
         try:
             from PIL import ImageGrab
             pil = ImageGrab.grabclipboard()
             if pil is None:
-                messagebox.showwarning(_L("클립보드","Clipboard"),_L("이미지가 없다.","No image found.")); return
+                messagebox.showwarning(_L("클립보드","Clipboard"),
+                                       _L("이미지가 없다.","No image found.")); return
             if isinstance(pil, list):
                 pil = Image.open(pil[0]) if pil else None
             if pil is None: return
-            self._pred_rgb = np.array(pil.convert("RGB"))
-            self._pred_roi = None
-            self._pred_roi_info.set(_L("ROI 미선택","No ROI selected"))
-            self._pred_draw_preview()
+            ts = datetime.datetime.now().strftime("%H%M%S")
+            self._pred_add_target(pil, f"clipboard_{ts}.png")
         except Exception as ex:
             messagebox.showerror(_L("오류","Error"), str(ex))
 
     def _pred_draw_preview(self):
-        self._pred_cv.delete("all")
-        if self._pred_rgb is None: return
-        cw = self._pred_cv.winfo_width()  or 300
-        ch = self._pred_cv.winfo_height() or 200
-        pil = Image.fromarray(self._pred_rgb)
-        pil.thumbnail((cw, ch), Image.LANCZOS)
-        if self._pred_roi:
-            scale = pil.width / self._pred_rgb.shape[1]
-            x0,y0,x1,y1 = [int(v*scale) for v in self._pred_roi]
-            dark = pil.point(lambda p: int(p*0.3))
-            mp = Image.new("L", pil.size, 0)
-            ImageDraw.Draw(mp).rectangle([x0,y0,x1,y1], fill=255)
-            pil = Image.composite(pil, dark, mp)
-            ImageDraw.Draw(pil).rectangle([x0,y0,x1,y1],
-                                          outline=(59,130,246), width=2)
-        tk_img = ImageTk.PhotoImage(pil)
-        self._refs["pred_prev"] = tk_img
-        self._pred_cv.create_image(cw//2, ch//2,
-                                   anchor="center", image=tk_img)
+        """호환용 stub — 카드 리스트가 미리보기 역할."""
+        try:
+            self._pred_rebuild_cards()
+        except Exception:
+            pass
 
-    def _pred_open_roi(self):
-        if self._pred_rgb is None:
-            messagebox.showinfo(_L("알림","Info"),_L("이미지를 먼저 선택한다.","Select an image first.")); return
-        fake_entry = {"name":"target", "rgb":self._pred_rgb,
-                      "roi": self._pred_roi}
+    def _pred_open_roi(self, tid=None):
+        """[🎯 ROI 보정] 핸들러. tid 가 None 이면 첫 target."""
+        if tid is None:
+            if not self._pred_targets:
+                messagebox.showinfo(_L("알림","Info"),
+                                    _L("평가대상을 먼저 추가한다.",
+                                       "Add a target first."))
+                return
+            t = self._pred_targets[0]
+        else:
+            t = self._pred_get_target_by_tid(tid)
+            if t is None:
+                return
+        if t.get("rgb") is None:
+            return
+        fake_entry = {"name": t.get("name","target"),
+                      "rgb":  t["rgb"],
+                      "roi":  t.get("roi")}
         def on_confirm(roi, _img=None):
-            self._pred_roi = roi
-            w=roi[2]-roi[0]; h=roi[3]-roi[1]
-            self._pred_roi_info.set(f"✔ ROI {w}×{h}px")
-            self._pred_draw_preview()
+            t["roi"]        = roi
+            t["roi_source"] = "manual"
+            try:
+                flag, reason = evaluate_roi_quality(t["rgb"], roi)
+                t["roi_flag"]   = flag
+                t["roi_reason"] = reason
+            except Exception:
+                t["roi_flag"]   = "manual"
+                t["roi_reason"] = "manual"
+            try:
+                t["thumb"] = make_thumb(t["rgb"], 90, 70, roi)
+            except Exception:
+                pass
+            # ROI 변경 시 결과 무효화 (재계산 필요)
+            t["result"] = None
+            # Advanced 탭 stale 방지
+            self._last_eval_ctx = None
+            self._pred_rebuild_cards()
         ROISelector(self, fake_entry, on_confirm)
 
-    def _pred_clear_roi(self):
-        self._pred_roi = None
-        self._pred_roi_info.set(_L("ROI 미선택","No ROI selected"))
-        self._pred_draw_preview()
+    def _pred_open_color(self, tid):
+        """[🎨 색상] 핸들러 — 다음 사용 가능한 색상으로 cycling."""
+        t = self._pred_get_target_by_tid(tid)
+        if t is None:
+            return
+        cur = t.get("color")
+        try:
+            idx = TARGET_COLOR_PALETTE.index(cur)
+        except ValueError:
+            idx = -1
+        used = {x.get("color") for x in self._pred_targets if x is not t}
+        for j in range(1, len(TARGET_COLOR_PALETTE)+1):
+            cand = TARGET_COLOR_PALETTE[(idx+j) % len(TARGET_COLOR_PALETTE)]
+            if cand not in used:
+                t["color"] = cand
+                break
+        self._pred_rebuild_cards()
 
-    def _run_predict(self):
-        if self._pred_rgb is None:
-            messagebox.showwarning(_L("주의","Warning"),"분석 대상 이미지를 선택한다."); return
+    def _pred_clear_roi(self, tid=None):
+        """호환용 — tid 의 ROI 를 자동 재추정."""
+        if tid is None:
+            if not self._pred_targets:
+                return
+            t = self._pred_targets[0]
+        else:
+            t = self._pred_get_target_by_tid(tid)
+            if t is None:
+                return
+        try:
+            roi, flag, reason = auto_detect_roi(t["rgb"])
+        except Exception:
+            h, w = t["rgb"].shape[:2]
+            roi = (w//4, h//4, 3*w//4, 3*h//4)
+            flag = "failed"
+            reason = "auto_detect_roi 실패"
+        t["roi"]        = roi
+        t["roi_flag"]   = flag
+        t["roi_reason"] = reason
+        t["roi_source"] = "auto"
+        try:
+            t["thumb"] = make_thumb(t["rgb"], 90, 70, roi)
+        except Exception:
+            pass
+        t["result"] = None
+        # Advanced 탭 stale 방지
+        self._last_eval_ctx = None
+        self._pred_rebuild_cards()
 
-        cond_input = self._pred_cond_var.get().strip()
-        roi = self._pred_roi
+    # ─────────────────────────────────────────
+    #  카드 빌드
+    # ─────────────────────────────────────────
+    def _pred_rebuild_cards(self):
+        """카드 리스트 다시 그리기."""
+        if not hasattr(self, "_pred_lf"):
+            return
+        for w in self._pred_lf.winfo_children():
+            w.destroy()
 
-        # 참조 이미지 풀 (현재 세션 + 분석 완료된 것)
+        n = len(self._pred_targets)
+        if hasattr(self, "_pred_count_var"):
+            self._pred_count_var.set(f"{n}/{PRED_MAX_TARGETS}")
+        # ➕ 추가 버튼 활성/비활성
+        if hasattr(self, "_pred_add_btn"):
+            self._pred_add_btn.configure(
+                state="disabled" if n >= PRED_MAX_TARGETS else "normal",
+                bg=BTN if n >= PRED_MAX_TARGETS else ACCENT,
+                fg=SUB if n >= PRED_MAX_TARGETS else "white")
+
+        if n == 0:
+            tk.Label(self._pred_lf,
+                     text=_L("평가대상을 추가하세요.\n드래그앤드롭 OK",
+                             "Add evaluation targets.\n(Drag&drop supported)"),
+                     bg=PANEL, fg=SUB, font=("Segoe UI",8),
+                     justify="center").pack(padx=4, pady=20)
+            return
+
+        for t in self._pred_targets:
+            tid = t.get("tid")
+            is_sel = (tid == self._pred_sel_tid)
+            roi_flag = t.get("roi_flag")
+            has_roi = t.get("roi") is not None
+            # 카드 테두리 색 (PURPLE 제외 — 그룹 일관성 적용 X)
+            brd = _border_color_for_roi(
+                roi_flag, has_roi,
+                {"green": GREEN, "amber": AMBER, "red": RED,
+                 "purple": PURPLE, "border": BORDER},
+                inconsistent=False)
+            if is_sel:
+                brd = ACCENT
+            thick = 2 if (is_sel or
+                          roi_flag in ("warn_small","warn_off",
+                                       "warn_paper","failed")) else 1
+
+            card = tk.Frame(self._pred_lf,
+                            bg=CARD2 if is_sel else CARD,
+                            highlightbackground=brd,
+                            highlightthickness=thick,
+                            cursor="hand2")
+            card.pack(fill="x", padx=4, pady=3)
+            card.bind("<Button-1>",
+                      lambda e, x=tid: self._pred_select(x))
+
+            # 1행: 썸네일 + 색상 + 이름 + ❌
+            r1 = tk.Frame(card, bg=card["bg"])
+            r1.pack(fill="x", padx=5, pady=(5,2))
+
+            th = t.get("thumb")
+            if th is not None:
+                try:
+                    pil_copy = th.copy()
+                    pil_copy.thumbnail((90,70), Image.LANCZOS)
+                    tk_th = ImageTk.PhotoImage(pil_copy)
+                    self._refs[f"pred_card_th_{tid}"] = tk_th
+                    th_lbl = tk.Label(r1, image=tk_th,
+                                       bg=card["bg"], cursor="hand2")
+                    th_lbl.pack(side="left", padx=(0,4))
+                    th_lbl.bind("<Button-1>",
+                                lambda e, x=tid: self._pred_select(x))
+                except Exception:
+                    tk.Label(r1, text="📷", bg=card["bg"],
+                             fg=SUB, font=("Segoe UI",16),
+                             width=4).pack(side="left", padx=(0,4))
+            else:
+                tk.Label(r1, text="📷", bg=card["bg"],
+                         fg=SUB, font=("Segoe UI",16),
+                         width=4).pack(side="left", padx=(0,4))
+
+            # 색상 사각형
+            color_sq = tk.Frame(r1, bg=t.get("color",ACCENT),
+                                width=12, height=12,
+                                highlightbackground=BORDER,
+                                highlightthickness=1)
+            color_sq.pack(side="left", padx=(0,4))
+            color_sq.pack_propagate(False)
+
+            name = t.get("name","")
+            if len(name) > 18:
+                name_disp = name[:17] + "…"
+            else:
+                name_disp = name
+            tk.Label(r1, text=name_disp,
+                     bg=card["bg"], fg=TXT, font=MFB,
+                     anchor="w").pack(side="left", fill="x",
+                                      expand=True)
+
+            tk.Button(r1, text="❌",
+                      command=lambda x=tid:
+                          self._pred_remove_target(x),
+                      bg=card["bg"], fg=RED, font=LF,
+                      relief="flat", cursor="hand2",
+                      padx=3).pack(side="right")
+
+            # 2행: ROI 상태
+            r2 = tk.Frame(card, bg=card["bg"])
+            r2.pack(fill="x", padx=8, pady=1)
+            if has_roi:
+                roi = t["roi"]
+                rw = roi[2]-roi[0]; rh = roi[3]-roi[1]
+                sym = "✔" if roi_flag in ("good","manual") else \
+                      ("⚠" if roi_flag in ("warn_small","warn_off",
+                                            "warn_paper") else
+                       ("✗" if roi_flag=="failed" else "•"))
+                col = (GREEN if roi_flag in ("good","manual")
+                       else AMBER if roi_flag in
+                            ("warn_small","warn_off","warn_paper")
+                       else RED if roi_flag=="failed"
+                       else SUB)
+                src = t.get("roi_source","auto")
+                tk.Label(r2,
+                         text=f"ROI: {sym} {rw}×{rh} ({src})",
+                         bg=card["bg"], fg=col,
+                         font=("Segoe UI",7,"bold")
+                         ).pack(side="left")
+            else:
+                tk.Label(r2, text=_L("ROI: 없음","ROI: none"),
+                         bg=card["bg"], fg=AMBER,
+                         font=("Segoe UI",7,"bold")
+                         ).pack(side="left")
+
+            # 3행: 결과 요약
+            r3 = tk.Frame(card, bg=card["bg"])
+            r3.pack(fill="x", padx=8, pady=1)
+            res = t.get("result")
+            if res:
+                ed = res.get("est_day")
+                conf = res.get("confidence", 0)
+                bm = res.get("best_match", "—")
+                ed_str = f"{ed:.1f}" if ed is not None else "—"
+                tk.Label(r3,
+                         text=f"Day={ed_str}  "
+                              f"Conf={conf:.0f}%  "
+                              f"Best={bm}",
+                         bg=card["bg"], fg=GOLD,
+                         font=("Segoe UI",7),
+                         anchor="w").pack(side="left", fill="x",
+                                          expand=True)
+            else:
+                tk.Label(r3, text=_L("(미분석)","(not analyzed)"),
+                         bg=card["bg"], fg=SUB,
+                         font=("Segoe UI",7,"italic")
+                         ).pack(side="left")
+
+            # 4행: 버튼들
+            r4 = tk.Frame(card, bg=card["bg"])
+            r4.pack(fill="x", padx=5, pady=(2,5))
+            tk.Button(r4, text=_L("🎯 ROI","🎯 ROI"),
+                      command=lambda x=tid: self._pred_open_roi(x),
+                      bg=BTN, fg=TEAL,
+                      font=("Segoe UI",7,"bold"),
+                      relief="flat", cursor="hand2",
+                      padx=4, pady=1).pack(side="left", padx=(0,3))
+            tk.Button(r4, text=_L("🎨 색상","🎨 Color"),
+                      command=lambda x=tid: self._pred_open_color(x),
+                      bg=BTN, fg=t.get("color",ACCENT),
+                      font=("Segoe UI",7,"bold"),
+                      relief="flat", cursor="hand2",
+                      padx=4, pady=1).pack(side="left", padx=3)
+
+    # ─────────────────────────────────────────
+    #  분석 — 단일 target / 전체 실행
+    # ─────────────────────────────────────────
+    def _pred_compute_one(self, t: dict):
+        """단일 target 분석. 결과 dict 를 반환 (또는 None)."""
+        rgb = t.get("rgb")
+        if rgb is None:
+            return None
+
+        # 참조 풀
         ref_pool = [img for img in self.images
                     if not np.isnan(img.get("lab",{}).get("b", np.nan))]
         if not ref_pool:
-            messagebox.showwarning(_L("주의","Warning"),
-                "No analyzed reference images.\nRun [▶ Analyze All] or load DB first.")
-            return
-        # 분석 대상 이미지 지표 계산
+            return None
+
+        roi = t.get("roi")
         if roi:
-            mask = roi_to_mask(self._pred_rgb.shape, roi)
+            mask = roi_to_mask(rgb.shape, roi)
         else:
-            # ROI 없으면 전체 이미지 사용
-            mask = np.ones(self._pred_rgb.shape[:2], bool)
-            roi  = (0,0,self._pred_rgb.shape[1],self._pred_rgb.shape[0])
+            mask = np.ones(rgb.shape[:2], bool)
+            roi  = (0,0,rgb.shape[1],rgb.shape[0])
 
         target = {
-            "s_mean":       compute_s_mean(self._pred_rgb, mask),
-            "yellow_ratio": compute_yellow_ratio(self._pred_rgb, mask),
-            "yellowness_idx": compute_yellowness_index(self._pred_rgb, mask),
-            "lab":          compute_lab_metrics(self._pred_rgb, mask),
-            "glcm":         compute_glcm_metrics(self._pred_rgb, mask),
-            # ── Advanced 탭에서 사용 ──
-            "rgb":          self._pred_rgb,
+            "s_mean":       compute_s_mean(rgb, mask),
+            "yellow_ratio": compute_yellow_ratio(rgb, mask),
+            "yellowness_idx": compute_yellowness_index(rgb, mask),
+            "lab":          compute_lab_metrics(rgb, mask),
+            "glcm":         compute_glcm_metrics(rgb, mask),
+            "rgb":          rgb,
             "mask":         mask,
             "roi":          roi,
         }
 
-        # 조건 필터링 (입력한 조건과 일치하는 것 우선, 없으면 전체)
+        cond_input = (t.get("cond_hint") or "").strip()
         if cond_input:
             pool_cond = [img for img in ref_pool
                          if img["cond"] == cond_input]
             if not pool_cond:
-                # 유사 조건 폴백
                 pool_cond = [img for img in ref_pool
                              if cond_input.lower() in img["cond"].lower()
                              or img["cond"].lower() in cond_input.lower()]
             if not pool_cond:
-                pool_cond = ref_pool   # 전체 사용
+                pool_cond = ref_pool
         else:
             pool_cond = ref_pool
 
-        # 유클리드 거리 계산
-        # 지표: b*, s_mean, yellowness_idx — 정규화 후 거리
         def _safe(v): return 0.0 if np.isnan(v) else float(v)
 
-        # 전체 범위로 정규화
         all_b  = [_safe(img["lab"]["b"])       for img in pool_cond]
         all_s  = [_safe(img["s_mean"])         for img in pool_cond]
         all_yi = [_safe(img["yellowness_idx"]) for img in pool_cond]
@@ -5613,22 +6240,18 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             i_b  = (_safe(img["lab"]["b"])       - b_mn)  / b_r
             i_s  = (_safe(img["s_mean"])         - s_mn)  / s_r
             i_yi = (_safe(img["yellowness_idx"]) - yi_mn) / yi_r
-            # 가중치 정규화
             wb  = self.cfg_w_b.get()
             ws  = self.cfg_w_s.get()
             wyi = self.cfg_w_yi.get()
             wt  = wb + ws + wyi
             if wt > 0: wb,ws,wyi = wb/wt, ws/wt, wyi/wt
-
             dist = (wb *(t_b-i_b)**2 +
                     ws *(t_s-i_s)**2 +
                     wyi*(t_yi-i_yi)**2) ** 0.5
             scores.append((dist, img))
-
         scores.sort(key=lambda x: x[0])
         top = scores[:min(5, len(scores))]
 
-        # 날짜 추정: 가중 평균 (거리 역수 가중)
         def df(d):
             try: return float(d)
             except: return None
@@ -5643,38 +6266,12 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         if day_weights:
             total_w = sum(w for _,w in day_weights)
             est_day = sum(d*w for d,w in day_weights) / total_w
-            confidence = max(0, 100 - top[0][0]*200)  # 거리 → 신뢰도
+            confidence = max(0, 100 - top[0][0]*200)
         else:
             est_day = None
             confidence = 0
 
-        # 결과 텍스트
-        best_dist, best_img = top[0]
-        if est_day is not None:
-            result_txt = (
-                f"Estimated Day: {est_day:.1f}  "
-                f"(Confidence {confidence:.0f}%)\n"
-                f"Best match: [{best_img['day']}d / {best_img['cond']}]  "
-                f"(dist={best_dist:.3f})\n"
-                f"Metrics:  b*={_safe(target['lab']['b']):.1f}  "
-                f"S={_safe(target['s_mean']):.1f}  "
-                f"YI={_safe(target['yellowness_idx']):.0f}"
-            )
-        else:
-            result_txt = _L("날짜 추정 불가 (참조 데이터 부족)","Cannot estimate (insufficient reference data)")
-
-        self._pred_result_var.set(result_txt)
-
-        # ── 분석 근거 코멘트 생성 ──────────────────
-        comment = self._generate_comment(
-            target, top, est_day, confidence,
-            cond_input, pool_cond)
-        self._pred_comment.configure(state="normal")
-        self._pred_comment.delete("1.0", "end")
-        self._pred_comment.insert("end", comment)
-        self._pred_comment.configure(state="disabled")
-
-        # delta_e 추가 (참조 0일차 기준)
+        # delta_e
         ref0 = next((img for img in pool_cond
                      if str(img.get("day","")) == "0"), None)
         if ref0 and "lab" in ref0:
@@ -5682,24 +6279,177 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         else:
             target["delta_e"] = float("nan")
 
-        # 차트/후보/Pseudo-Raman — after()로 지연 실행
-        self.after(50,  lambda t=target, tp=top, ed=est_day,
-                               sc=scores, pc=pool_cond:
-                   self._draw_pred_charts(t, tp, ed, sc, pc))
-        self.after(200, lambda t=target, tp=top:
-                   self._update_pred_candidates(t, tp))
-        if self._raman_data:
-            self.after(400, lambda t=target:
-                       self._run_pseudo_raman_inline(t))
-        else:
-            self._set_cmt(self._pseudo_res_txt,
-                "No Raman reference data loaded.\n"
-                "Load Excel in [📡 Raman Analysis] tab first,\n"
-                "then re-run Evaluation.")
+        best_dist, best_img = top[0] if top else (0.0, None)
+        best_match = (f"{best_img.get('cond','?')[:12]}-"
+                      f"{best_img.get('day','?')}d"
+                      if best_img else "—")
 
+        return {
+            "target_metrics": target,
+            "scores":         scores,
+            "top":            top,
+            "est_day":        est_day,
+            "confidence":     confidence,
+            "best_match":     best_match,
+            "best_dist":      best_dist,
+            "pool_cond":      pool_cond,
+            "cond_input":     cond_input,
+        }
+
+    def _pred_run_all(self):
+        """모든 평가대상을 동기 실행."""
+        if not self._pred_targets:
+            messagebox.showwarning(
+                _L("주의","Warning"),
+                _L("평가대상을 먼저 추가하세요.",
+                   "Add evaluation targets first."))
+            return
+        ref_pool = [img for img in self.images
+                    if not np.isnan(img.get("lab",{}).get("b", np.nan))]
+        if not ref_pool:
+            messagebox.showwarning(
+                _L("주의","Warning"),
+                _L("분석된 참조 이미지가 없습니다.\n"
+                   "[▶ Analyze All] 또는 DB 로드 먼저 실행하세요.",
+                   "No analyzed reference images.\n"
+                   "Run [▶ Analyze All] or load DB first."))
+            return
+
+        n = len(self._pred_targets)
+        for i, t in enumerate(self._pred_targets, start=1):
+            self._set_status(
+                _L(f"분석 중 ({i}/{n}): {t.get('name','')[:24]}",
+                   f"Analyzing ({i}/{n}): {t.get('name','')[:24]}"))
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
+            try:
+                res = self._pred_compute_one(t)
+                t["result"] = res
+            except Exception as ex:
+                t["result"] = None
+                self._set_status(
+                    _L(f"⚠ {t.get('name','?')} 분석 실패: {ex}",
+                       f"⚠ {t.get('name','?')} failed: {ex}"))
+
+        # 차트 + 카드 갱신
+        try:
+            self._pred_draw_all_charts()
+        except Exception as ex:
+            self._set_status(f"chart err: {ex}")
+        self._pred_rebuild_cards()
+
+        # 선택된 target 의 후보/Pseudo-Raman 갱신
+        sel = self._pred_get_target_by_tid(self._pred_sel_tid)
+        if sel and sel.get("result"):
+            res = sel["result"]
+            try:
+                self._update_pred_candidates(
+                    res.get("target_metrics",{}),
+                    res.get("top",[]))
+            except Exception:
+                pass
+            # 결과 요약 텍스트
+            ed = res.get("est_day")
+            conf = res.get("confidence",0)
+            best = res.get("best_match","—")
+            if ed is not None:
+                txt = (f"[{sel['name'][:18]}] "
+                       f"Day {ed:.1f} (Conf {conf:.0f}%)  "
+                       f"Best={best}")
+            else:
+                txt = _L(f"[{sel['name'][:18]}] 추정 불가",
+                         f"[{sel['name'][:18]}] cannot estimate")
+            try:
+                self._pred_result_var.set(txt)
+            except Exception:
+                pass
+            # 분석 근거 코멘트
+            try:
+                tm = res.get("target_metrics",{})
+                comment = self._generate_comment(
+                    tm, res.get("top",[]),
+                    ed, conf,
+                    res.get("cond_input",""),
+                    res.get("pool_cond",[]))
+                self._pred_comment.configure(state="normal")
+                self._pred_comment.delete("1.0","end")
+                self._pred_comment.insert("end", comment)
+                self._pred_comment.configure(state="disabled")
+            except Exception:
+                pass
+            # Pseudo-Raman
+            if self._raman_data:
+                try:
+                    self._run_pseudo_raman_inline(tm)
+                except Exception as ex:
+                    # 차트 명시 clear + 에러 표시 (이전 결과 표시 방지)
+                    try:
+                        self._pseudo_reg_fig.clear()
+                        ax = self._pseudo_reg_fig.add_subplot(111)
+                        ax.text(0.5, 0.5,
+                                _L(f"Pseudo-Raman 오류:\n{ex}",
+                                   f"Pseudo-Raman error:\n{ex}"),
+                                ha="center", va="center",
+                                color=RED, fontsize=8,
+                                transform=ax.transAxes)
+                        ax.axis("off")
+                        self._pseudo_reg_cv.draw()
+                    except Exception:
+                        pass
+                    try:
+                        self._pseudo_spec_fig.clear()
+                        ax = self._pseudo_spec_fig.add_subplot(111)
+                        ax.text(0.5, 0.5,
+                                _L(f"Pseudo-Raman 오류:\n{ex}",
+                                   f"Pseudo-Raman error:\n{ex}"),
+                                ha="center", va="center",
+                                color=RED, fontsize=8,
+                                transform=ax.transAxes)
+                        ax.axis("off")
+                        self._pseudo_spec_cv.draw()
+                    except Exception:
+                        pass
+                    self._set_status(
+                        _L(f"⚠ Pseudo-Raman 분석 오류: {ex}",
+                           f"⚠ Pseudo-Raman error: {ex}"))
+
+        ok = sum(1 for t in self._pred_targets if t.get("result"))
         self._set_status(
-            f"✓ Estimated: Day {est_day:.1f} (confidence {confidence:.0f}%)"
-            if est_day else "Estimation failed")
+            _L(f"✓ 분석 완료: {ok}/{n}",
+               f"✓ Done: {ok}/{n}"))
+
+    def _run_predict(self):
+        """호환용 — 단일 흐름 호출 시 _pred_run_all 로 위임"""
+        self._pred_run_all()
+
+    def _pred_draw_all_charts(self):
+        """모든 target 의 결과를 차트에 동시 표시 (선택된 target 컨텍스트 기반)."""
+        # 선택된 target 의 결과를 메인 ctx 로 사용
+        sel = self._pred_get_target_by_tid(self._pred_sel_tid)
+        sel_res = sel.get("result") if sel else None
+        if sel_res:
+            target = sel_res.get("target_metrics",{})
+            top    = sel_res.get("top",[])
+            est_day= sel_res.get("est_day")
+            scores = sel_res.get("scores",[])
+            pool   = sel_res.get("pool_cond",[])
+            self._draw_pred_charts(target, top, est_day, scores, pool)
+        else:
+            # 결과 없음 — 빈 화면
+            for key in ("radar","timeline"):
+                if key in self._pred_figs:
+                    fig = self._pred_figs[key]["fig"]
+                    fig.clear()
+                    ax = fig.add_subplot(111)
+                    ax.set_facecolor(PANEL2)
+                    ax.text(0.5,0.5,"No results",
+                            transform=ax.transAxes,
+                            ha="center",va="center",
+                            color=SUB, fontsize=8)
+                    ax.axis("off")
+                    self._pred_figs[key]["cv"].draw()
 
     def _run_pseudo_raman_inline(self, target: dict):
         """Pseudo-Raman: 회귀 앙상블 → 추정 스펙트럼. 컨텍스트 _last_eval_ctx에 저장."""
@@ -5968,21 +6718,44 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             ys = np.array([p["norm_peak"] for p in pairs])
             ax.scatter(xs, ys, color=ACCENT, s=ms*8, zorder=5, alpha=0.85)
 
-            tv = t_map.get(key2, 0)
-            ax.axvline(tv, color=RED, lw=1.5 if large else 0.8,
-                       ls="--", alpha=0.8)
-
             if key2 in coef_map:
                 coef = coef_map[key2]
                 xl   = np.linspace(xs.min(), xs.max(), 60)
                 ax.plot(xl, np.polyval(coef, xl),
                         "--", color=AMBER,
                         lw=1.5 if large else 0.8, alpha=0.85)
-                pred = float(np.polyval(coef, tv))
-                ax.plot(tv, pred, "v", color=RED, ms=ms+2, zorder=6)
+
+                # ── 모든 평가대상의 ★ 마커 표시 ──
+                targets_with_result = [
+                    tt for tt in getattr(self, "_pred_targets", [])
+                    if tt.get("result")]
+                for tt in targets_with_result:
+                    tm_t = tt["result"].get("target_metrics", {})
+                    tv_t = {
+                        "b":  _safe(tm_t.get("lab",{}).get("b",0)),
+                        "s":  _safe(tm_t.get("s_mean",0)),
+                        "yi": _safe(tm_t.get("yellowness_idx",0)),
+                        "de": _safe(tm_t.get("delta_e",0)),
+                    }.get(key2, 0)
+                    pred_t = float(np.polyval(coef, tv_t))
+                    col_t = tt.get("color", RED)
+                    ax.plot(tv_t, pred_t, "*",
+                            color=col_t, ms=ms+4, zorder=7,
+                            markeredgecolor="white",
+                            markeredgewidth=0.6)
+
+                # 호환용 — 단일 target (선택된) 도 v 마커 (for 루프 밖)
+                if not targets_with_result:
+                    tv = t_map.get(key2, 0)
+                    pred = float(np.polyval(coef, tv))
+                    ax.axvline(tv, color=RED,
+                               lw=1.5 if large else 0.8,
+                               ls="--", alpha=0.8)
+                    ax.plot(tv, pred, "v", color=RED,
+                            ms=ms+2, zorder=6)
 
                 r2 = r2_map.get(key2, 0)
-                ann = f"R²={r2:.2f}\np={pred:.2f}"
+                ann = f"R²={r2:.2f}"
                 ax.text(0.04, 0.96, ann,
                         transform=ax.transAxes, fontsize=fs_k,
                         color=AMBER, va="top",
@@ -6030,7 +6803,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 sh = np.array(spec["shifts"])
                 iv = np.array(spec["intensities"])
                 ref_spectra.append((sh, iv, p["day"], p.get("norm_peak",0)))
-                ax.plot(sh, iv, lw=0.8, alpha=0.22,
+                # 참조 — 알파 낮춰
+                ax.plot(sh, iv, lw=0.8, alpha=0.15,
                         color=SUB, zorder=1)
 
         if len(ref_spectra) >= 2:
@@ -6042,12 +6816,26 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             alpha = max(0.0, min(1.0, alpha))
             v_est = alpha*v1 + (1-alpha)*v2i
             band  = abs(ci_hi-ci_lo)/2 * 0.5
+            # 신뢰구간 밴드 — 선택된 target 색상
+            sel_t = self._pred_get_target_by_tid(
+                getattr(self, "_pred_sel_tid", None))
+            sel_color = sel_t.get("color", ACCENT) if sel_t else ACCENT
             ax.fill_between(s1,
                             v_est*(1-band), v_est*(1+band),
-                            alpha=0.25, color=ACCENT,
-                            label="95% CI band", zorder=2)
-            ax.plot(s1, v_est, lw=lw, color=ACCENT,
-                    label=f"Est. peak={est_peak:.3f}", zorder=3)
+                            alpha=0.18, color=sel_color, zorder=2)
+            ax.plot(s1, v_est, lw=lw, color=sel_color,
+                    alpha=0.85, zorder=3)
+
+            # ── 모든 target 의 추정 스펙트럼 다중 표시 ──
+            for tt in getattr(self, "_pred_targets", []):
+                if tt is sel_t or not tt.get("result"):
+                    continue
+                # 다른 target 도 스펙트럼이 있으면 표시 (alpha 낮춰)
+                # 비활성 target 은 자체 ctx 가 없으므로, 같은 v_est 로
+                # alpha 낮춰 그리는 정도로만 표시 (근사값)
+                col_t = tt.get("color", ACCENT)
+                ax.plot(s1, v_est, lw=max(0.6,lw*0.5),
+                        color=col_t, alpha=0.30, zorder=2)
 
             # 참조선
             ax.annotate(
@@ -6061,7 +6849,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         ax.set_title(
             f"Pseudo-Raman Spectrum  (A₁g≈{est_peak:.3f}±{est_se:.3f})",
             color=TXT, fontsize=fs_t)
-        ax.legend(fontsize=max(5,fs_k), framealpha=0.8, edgecolor=BORDER)
+        # 차트 내 범례 생략 (카드 색상 표시가 범례)
         fig.tight_layout(pad=0.6)
 
 
@@ -6730,14 +7518,33 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         ax.set_facecolor(PANEL2)
         fig.patch.set_facecolor(PANEL)
 
-        target_v = [_safe(target["lab"]["b"])/80,
-                    _safe(target["s_mean"])/200,
-                    _safe(target["yellowness_idx"])/120,
-                    _safe(target.get("yellow_ratio",0))*3]
-        target_v += target_v[:1]
-        ax.plot(angles, target_v, "o-", color=RED, lw=lw, label="Target")
-        ax.fill(angles, target_v, alpha=0.15, color=RED)
+        # ── 모든 평가대상 target 을 동시 표시 ──
+        targets_with_result = [
+            t for t in getattr(self, "_pred_targets", [])
+            if t.get("result")]
 
+        if targets_with_result:
+            for ti, t in enumerate(targets_with_result):
+                tm = t["result"].get("target_metrics", {})
+                v = [_safe(tm.get("lab",{}).get("b",0))/80,
+                     _safe(tm.get("s_mean",0))/200,
+                     _safe(tm.get("yellowness_idx",0))/120,
+                     _safe(tm.get("yellow_ratio",0))*3]
+                v += v[:1]
+                col = t.get("color", RED)
+                ax.plot(angles, v, "o-", color=col, lw=lw, alpha=0.9)
+                ax.fill(angles, v, alpha=0.10, color=col)
+        else:
+            # 호환용 — 단일 target 표시
+            target_v = [_safe(target.get("lab",{}).get("b",0))/80,
+                        _safe(target.get("s_mean",0))/200,
+                        _safe(target.get("yellowness_idx",0))/120,
+                        _safe(target.get("yellow_ratio",0))*3]
+            target_v += target_v[:1]
+            ax.plot(angles, target_v, "o-", color=RED, lw=lw)
+            ax.fill(angles, target_v, alpha=0.15, color=RED)
+
+        # Top-3 후보 (선택된 target 의 top)
         for ci2, (dist, img) in enumerate(top[:3]):
             iv = [_safe(img["lab"]["b"])/80,
                   _safe(img["s_mean"])/200,
@@ -6745,20 +7552,16 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                   _safe(img.get("yellow_ratio",0))*3]
             iv += iv[:1]
             col = [COND_COLORS[0], COND_COLORS[1], COND_COLORS[2]][ci2]
-            ax.plot(angles, iv, "--", color=col, lw=max(0.8,lw*0.7), alpha=0.8,
-                    label=f"#{ci2+1} {img['cond'][:8]} D{img['day']}")
-            ax.fill(angles, iv, alpha=0.06, color=col)
+            ax.plot(angles, iv, "--", color=col,
+                    lw=max(0.8,lw*0.7), alpha=0.6)
+            ax.fill(angles, iv, alpha=0.04, color=col)
 
         ax.set_xticks(angles[:-1])
         ax.set_xticklabels(metrics, fontsize=fs_k, color=SUB)
         ax.tick_params(colors=SUB, labelsize=max(4,fs_k-1))
         ax.set_title("Metric Similarity", color=TXT, fontsize=fs_t,
                      pad=8 if large else 4)
-        leg_fs = max(5, fs_k-1)
-        ax.legend(fontsize=leg_fs,
-                  loc="upper right",
-                  bbox_to_anchor=(1.3 if large else 1.25, 1.1),
-                  framealpha=0.8)
+        # 차트 내 범례 생략 (카드 색상 표시가 범례)
         fig.tight_layout(pad=0.3)
 
     def _draw_timeline_fig(self, fig, target, est_day, scores, large: bool):
@@ -6794,7 +7597,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 ys = [p[1] for p in pts]
                 col = COND_COLORS[ci2 % len(COND_COLORS)]
                 ax.plot(xs, ys, "o-", color=col, lw=lw, ms=ms,
-                        alpha=0.8, label=cond[:14])
+                        alpha=0.8)
                 for x,y in zip(xs, ys):
                     ax.annotate(f"D{x:.0f}",
                                 xy=(x,y), xytext=(0,5),
@@ -6802,14 +7605,40 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                                 fontsize=max(4,fs_k-2),
                                 color=col, ha="center")
 
-        if est_day is not None:
-            ax.axvline(est_day, color=RED, lw=lw,
-                       ls="--", label=f"Est.={est_day:.1f}d")
+        # ── 모든 평가대상의 est_day 를 ★ 마커로 표시 ──
+        targets_with_result = [
+            t for t in getattr(self, "_pred_targets", [])
+            if t.get("result") and t["result"].get("est_day") is not None]
+        # y 위치: 화면 하단 5% 지점
+        if targets_with_result:
+            ymin, ymax = ax.get_ylim() if day_dist else (0, 1)
+            y_marker = ymin + (ymax-ymin)*0.05
+            for ti, t in enumerate(targets_with_result):
+                ed_t = t["result"]["est_day"]
+                col = t.get("color", RED)
+                # tid 인덱스 — 카드 표시 순서대로 T1, T2 ...
+                idx = next((j for j, x in
+                            enumerate(self._pred_targets,start=1)
+                            if x is t), ti+1)
+                ax.plot(ed_t, y_marker, "*",
+                        color=col, ms=ms*2, zorder=10,
+                        markeredgecolor="white", markeredgewidth=0.8)
+                ax.annotate(f"T{idx}",
+                            xy=(ed_t, y_marker),
+                            xytext=(0, ms*1.5+2),
+                            textcoords="offset points",
+                            fontsize=max(5,fs_k-1),
+                            color=col, ha="center",
+                            fontweight="bold")
+        elif est_day is not None:
+            # 호환용
+            ax.axvline(est_day, color=RED, lw=lw, ls="--")
 
         ax.set_xlabel("Day", color=SUB, fontsize=fs_a)
-        ax.set_ylabel("Distance (lower=more similar)", color=SUB, fontsize=fs_a)
+        ax.set_ylabel("Distance (lower=more similar)",
+                      color=SUB, fontsize=fs_a)
         ax.set_title("Distance Timeline", color=TXT, fontsize=fs_t)
-        ax.legend(fontsize=max(5,fs_k), framealpha=0.8, edgecolor=BORDER)
+        # 차트 내 범례 생략 (카드 색상 표시가 범례)
         fig.tight_layout(pad=0.5)
 
 
@@ -12587,6 +13416,36 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
               if os.path.splitext(p)[1].lower() in _IMG_EXTS]
         if not imgs:
             self.sv.set(_L("⚠ 이미지 파일 없음","⚠ No image files")); return
+        # ── Evaluation 탭 활성화 시: 평가대상으로 추가 ──
+        try:
+            if self._atab.get() == "predict":
+                cap = PRED_MAX_TARGETS - len(self._pred_targets)
+                if cap <= 0:
+                    messagebox.showwarning(
+                        _L("평가대상 가득", "Targets full"),
+                        _L(f"이미 {PRED_MAX_TARGETS}개입니다. 기존 항목을 삭제 후 다시 시도하세요.",
+                           f"Already at {PRED_MAX_TARGETS}. Remove some first."))
+                    return
+                accepted = imgs[:cap]
+                skipped  = len(imgs) - cap
+                added    = 0
+                for p in accepted:
+                    try:
+                        self._pred_add_target(Image.open(p),
+                                              os.path.basename(p))
+                        added += 1
+                    except Exception as ex:
+                        messagebox.showerror(_L("오류","Error"),
+                                             f"{p}\n{ex}")
+                msg = _L(f"✓ 평가대상 {added}개 추가",
+                         f"✓ {added} target(s) added")
+                if skipped > 0:
+                    msg += _L(f"  (한도 초과로 {skipped}개 스킵)",
+                              f"  ({skipped} skipped — over limit)")
+                self._set_status(msg)
+                return
+        except Exception:
+            pass
         for p in imgs:
             try: self._add_image(Image.open(p), os.path.basename(p))
             except Exception as ex:
