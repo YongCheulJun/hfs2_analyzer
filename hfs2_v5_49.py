@@ -1657,6 +1657,13 @@ class App(_Base):
         tk.Label(hf, text=_L("  📋 이미지 목록","  📋 Image List"),
                  bg=PANEL2, fg=TXT, font=MFB).pack(side="left",pady=6,padx=8)
 
+        # 전체 삭제 버튼 (Raman 데이터는 보존)
+        tk.Button(hf, text=_L("🗑 전체 삭제","🗑 Delete All"),
+                  command=self._delete_all_images,
+                  bg=PANEL2, fg=RED, font=("Segoe UI",8,"bold"),
+                  relief="flat", padx=8, pady=2, cursor="hand2",
+                  activebackground=PANEL).pack(side="left", padx=4, pady=4)
+
         self._roi_stat = tk.StringVar(value="ROI 0/0")
         self._roi_ok_lbl = tk.Label(hf, textvariable=self._roi_stat,
                                     bg=PANEL2, fg=AMBER, font=MFB)
@@ -12341,6 +12348,39 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         if self.sel_idx>=len(self.images):
             self.sel_idx=len(self.images)-1
         self._rebuild_list(); self._refresh_orig()
+
+    def _delete_all_images(self):
+        """이미지 목록만 전체 삭제 (Raman 데이터는 보존)."""
+        if not self.images:
+            self._set_status(_L("삭제할 이미지 없음", "No images to delete"))
+            return
+        n = len(self.images)
+        if not messagebox.askyesno(
+                _L("확인", "Confirm"),
+                _L(f"이미지 {n}장을 모두 삭제할까요?\n(Raman 데이터는 유지됩니다)",
+                   f"Delete all {n} images?\n(Raman data will be kept)")):
+            return
+        self.images.clear()
+        self.sel_idx = -1
+        self._refs.clear()
+        self._rebuild_list()
+        # 이미지 관련 캔버스/차트 초기화 (Raman 은 건드리지 않음)
+        try: self._orig_cv.delete("all")
+        except Exception: pass
+        try: self._hsi_cv.delete("all")
+        except Exception: pass
+        try: self.tree.delete(*self.tree.get_children())
+        except Exception: pass
+        try:
+            self.hm_fig.clear(); self.hm_cv.draw()
+        except Exception: pass
+        for c in self._charts.values():
+            try: c["fig"].clear(); c["cv"].draw()
+            except Exception: pass
+        for c in self._color_charts.values():
+            try: c["fig"].clear(); c["cv"].draw()
+            except Exception: pass
+        self._set_status(_L(f"이미지 {n}장 전체 삭제 완료", f"Deleted {n} images"))
 
     def _clear(self):
         if self.images and not messagebox.askyesno(
