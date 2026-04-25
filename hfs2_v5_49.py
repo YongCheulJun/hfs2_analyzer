@@ -366,14 +366,14 @@ def roi_to_mask(shape, roi):
 # ══════════════════════════════════════════════
 #  자동 ROI 추정 — HfS₂ 시편 vs 흰 종이 분리
 # ══════════════════════════════════════════════
-def _find_straightest_side_midpoint(contour, sx, sy, sbw, sbh):
-    """시편 contour 에서 곡률이 가장 낮은 (가장 직선에 가까운) 쪽의 중점.
+def _find_most_curved_side_midpoint(contour, sx, sy, sbw, sbh):
+    """시편 contour 에서 곡률이 가장 큰 (가장 원형에 가까운) 쪽의 중점.
 
     bbox 중심에서 4 사분면(상/하/좌/우) 으로 contour 점들을 분류한 뒤,
     각 사분면 점 분포에 PCA 적용 → 작은 eigenvalue / 큰 eigenvalue 비율
-    이 작을수록 직선에 가까움 (0 = 완벽 직선, 1 = 원).
+    이 클수록 원형에 가까움 (0 = 완벽 직선, 1 = 원).
 
-    Returns: (cx, cy) or None
+    Returns: (cx, cy) or None — 곡률 큰 사이드의 중점
     """
     try:
         pts = contour.reshape(-1, 2).astype(float)
@@ -391,8 +391,8 @@ def _find_straightest_side_midpoint(contour, sx, sy, sbw, sbh):
             else:
                 sides["bottom" if dy > 0 else "top"].append(p)
 
-        best_score = float("inf")
-        best_mid = None
+        worst_score = -1.0  # 곡률 가장 큰 점수 (작은/큰 eigvalue 비율 가장 큼)
+        worst_mid = None
         total = len(pts)
         for name, side_pts in sides.items():
             if len(side_pts) < 5:
@@ -408,15 +408,16 @@ def _find_straightest_side_midpoint(contour, sx, sy, sbw, sbh):
             eigvals = np.sort(eigvals)
             if eigvals[1] < 1.0:
                 continue
-            straight = float(eigvals[0] / eigvals[1])  # 0 ≈ 직선, 1 ≈ 원
-            # 사이드 점 수가 너무 적으면 신뢰도 낮음 → 패널티
+            curvature = float(eigvals[0] / eigvals[1])  # 0 ≈ 직선, 1 ≈ 원형
+            # 사이드 점 수가 너무 적으면 신뢰도 낮음 → 패널티 (점수 깎음)
             if len(side_pts) < total * 0.10:
-                straight += 0.3
-            if straight < best_score:
-                best_score = straight
-                best_mid = (float(mean[0]), float(mean[1]))
-        if best_mid is not None and best_score < 0.25:
-            return best_mid
+                curvature -= 0.10
+            if curvature > worst_score:
+                worst_score = curvature
+                worst_mid = (float(mean[0]), float(mean[1]))
+        # 충분한 곡률 있을 때만 인정 (직선이면 무의미)
+        if worst_mid is not None and worst_score > 0.04:
+            return worst_mid
     except Exception:
         pass
     return None
@@ -428,7 +429,7 @@ def auto_detect_roi(rgb: np.ndarray,
                     target_area_ratio: float = 0.13,
                     max_specimen_fraction: float = 0.70,
                     edge_margin_ratio: float = 0.05,
-                    bias_ratio: float = 0.22,
+                    bias_ratio: float = 0.30,
                     min_area_ratio: float = 0.03,
                     paper_inside_ratio: float = 0.02) -> tuple:
     """
@@ -436,8 +437,8 @@ def auto_detect_roi(rgb: np.ndarray,
 
     DB pkw_1.db 의 사용자 패턴 + 사용자 추가 요구:
       - ROI 면적 ≈ 이미지의 13% (DB 23.8% 보다 약 45% 작게)
-      - ROI 중심 ≈ 시편 bbox 중심에서 **곡률이 가장 낮은(직선에 가까운) 쪽**
-        의 중점 방향으로 22% 이동
+      - ROI 중심 ≈ 시편 bbox 중심에서 **곡률이 가장 큰 변의 중심으로부터
+        법선 방향으로 멀어지는 쪽** 으로 30% 이동
       - 가로/세로 비 = 시편 bbox 비율
       - 이미지 가장자리 5% 안쪽 보장
 
@@ -445,10 +446,11 @@ def auto_detect_roi(rgb: np.ndarray,
     1) HSV V/S 로 paper 마스크 추출
     2) non_paper 형태학 정리 (open + close)
     3) 가장 큰 contour 의 bbox = 시편 bbox (sx, sy, sbw, sbh)
-    4) `_find_straightest_side_midpoint` — bbox 중심으로 contour 점을 4 사분면
-       으로 분류, 각 사분면 PCA 직진성 측정, 가장 직선에 가까운 사이드 중점 반환
+    4) `_find_most_curved_side_midpoint` — bbox 중심으로 contour 점을 4 사분면
+       으로 분류, 각 사분면 PCA 곡률 측정, 가장 원형에 가까운 사이드 중점 반환
     5) 목표 ROI 너비/높이 산출 (target_area_ratio + aspect)
-    6) ROI 중심 = bbox 중심 + (직선 사이드 중점 - bbox 중심) × bias_ratio
+    6) ROI 중심 = bbox 중심 + (bbox 중심 - 곡률 큰 사이드 중점) × bias_ratio
+       즉 곡률 큰 변에서 멀어지는 방향(법선 안쪽)으로 이동.
        못 찾으면 bbox 중심 그대로
     7) edge_margin_ratio (5%) 안쪽으로 밀어넣기
     8) 품질 평가: 면적 / 가장자리 근접 / paper 비율
@@ -497,13 +499,14 @@ def auto_detect_roi(rgb: np.ndarray,
         roi_w = max(roi_w, int(min(w, sbw) * 0.18))
         roi_h = max(roi_h, int(min(h, sbh) * 0.18))
 
-        # ROI 중심 — bbox 중심에서 곡률 낮은 사이드 중점 쪽으로 약간 이동
+        # ROI 중심 — 곡률 큰 사이드 중점에서 멀어지는 방향(법선)으로 이동
         cx_base = sx + sbw / 2
         cy_base = sy + sbh / 2
-        target_pt = _find_straightest_side_midpoint(c, sx, sy, sbw, sbh)
-        if target_pt is not None:
-            cx = cx_base + (target_pt[0] - cx_base) * bias_ratio
-            cy = cy_base + (target_pt[1] - cy_base) * bias_ratio
+        curved_pt = _find_most_curved_side_midpoint(c, sx, sy, sbw, sbh)
+        if curved_pt is not None:
+            # bbox 중심 - curved_mid = 곡률 변에서 시편 내부로 향하는 벡터 (법선)
+            cx = cx_base + (cx_base - curved_pt[0]) * bias_ratio
+            cy = cy_base + (cy_base - curved_pt[1]) * bias_ratio
         else:
             cx, cy = cx_base, cy_base
 
