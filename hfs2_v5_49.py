@@ -1423,17 +1423,17 @@ def _migrate_eval_target_schema(con):
 
 def db_save_all(path: str, images: list) -> int:
     """
-    분석 완료 이미지들을 DB에 저장 (upsert: name+cond+day 기준).
+    이미지들을 DB에 저장 (upsert: name+cond+day 기준).
+    분석 결과(s_mean 등)가 NaN 이어도 저장 — ROI 보존용 checkpoint 가능.
     저장된 행 수 반환.
     """
-    analyzed = [img for img in images
-                if not np.isnan(img.get("s_mean", np.nan))]
-    if not analyzed:
+    saveable = [img for img in images if img.get("rgb") is not None]
+    if not saveable:
         return 0
 
     con = db_init(path)
     count = 0
-    for img in analyzed:
+    for img in saveable:
         roi = img.get("roi")
         lab  = img.get("lab",  {})
         glcm = img.get("glcm", {})
@@ -4970,11 +4970,24 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         self._set_status("📂 " + summary.split("\n")[0])
 
     def _db_save(self):
-        analyzed = [img for img in self.images
-                    if not np.isnan(img.get("s_mean", np.nan))]
-        if not analyzed:
-            messagebox.showwarning("Warning",
-                "No analyzed images to save."); return
+        if not self.images:
+            messagebox.showwarning(_L("주의", "Warning"),
+                _L("저장할 이미지가 없습니다.\n먼저 이미지를 추가하세요.",
+                   "No images to save.\nAdd images first."))
+            return
+        analyzed_n = sum(1 for img in self.images
+                         if not np.isnan(img.get("s_mean", np.nan)))
+        # 분석 결과가 없어도 ROI 보존용 checkpoint 저장 가능 — 안내만 표시
+        if analyzed_n == 0:
+            if not messagebox.askyesno(
+                    _L("미분석 저장 확인", "Save without analysis?"),
+                    _L(f"분석된 이미지가 없습니다.\n"
+                       f"이미지/ROI/조건만 {len(self.images)}장 저장할까요?\n"
+                       f"(분석 결과는 모두 NULL 로 저장 — 다음에 ▶ Analyze All)",
+                       f"No analyzed images.\n"
+                       f"Save {len(self.images)} image(s) with ROI/cond only?\n"
+                       f"(Metrics saved as NULL — run ▶ Analyze All later)")):
+                return
 
         path = filedialog.asksaveasfilename(
             title="Save DB File",
@@ -5018,10 +5031,13 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 con.commit()
             finally:
                 con.close()
-            messagebox.showinfo("Saved",
-                f"Saved {n} images{eval_note} to DB.\n{path}")
+            unanalyzed = max(0, n - analyzed_n)
+            ana_note = (f"  ({analyzed_n} analyzed, {unanalyzed} ROI-only)"
+                        if unanalyzed > 0 else "")
+            messagebox.showinfo(_L("저장 완료", "Saved"),
+                f"Saved {n} images{ana_note}{eval_note} to DB.\n{path}")
             self._set_status(
-                f"🗄 DB saved — {n} records  ({os.path.basename(path)})")
+                f"🗄 DB saved — {n} records{ana_note}  ({os.path.basename(path)})")
         except Exception as ex:
             messagebox.showerror("Save Error", str(ex))
 
