@@ -1233,7 +1233,8 @@ def _migrate_eval_target_schema(con):
             for row in con.execute("PRAGMA table_info(eval_target)")}
     if {"target_id", "name", "color"}.issubset(cols):
         return "already_migrated"
-    # 백업 + 재구성
+    # 백업 + 재구성 — 기존 backup 이 있으면 먼저 정리 (가장 최신 backup 만 유지)
+    con.execute("DROP TABLE IF EXISTS eval_target_v1_backup")
     con.execute("ALTER TABLE eval_target RENAME TO eval_target_v1_backup")
     con.execute(
         "CREATE TABLE eval_target ("
@@ -1841,7 +1842,7 @@ class App(_Base):
         for c in TARGET_COLOR_PALETTE:
             if c not in used:
                 return c
-        # 팔레트 다 쓰면 인덱스로 fallback
+        # 8개 모두 사용 중이면 PRED_MAX_TARGETS 가드로 도달 불가 (방어 코드)
         return TARGET_COLOR_PALETTE[len(self._pred_targets)
                                     % len(TARGET_COLOR_PALETTE)]
 
@@ -4848,6 +4849,15 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 con.commit(); con.close()
                 eval_note = (f" + {len(self._pred_targets)} "
                              "evaluation targets")
+            # 마이그레이션 백업 테이블 자동 정리 (저장 정상 완료 시)
+            try:
+                import sqlite3 as _sq2
+                _con2 = _sq2.connect(path)
+                _con2.execute(
+                    "DROP TABLE IF EXISTS eval_target_v1_backup")
+                _con2.commit(); _con2.close()
+            except Exception:
+                pass
             messagebox.showinfo("Saved",
                 f"Saved {n} images{eval_note} to DB.\n{path}")
             self._set_status(
@@ -4978,6 +4988,15 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                      None))
                 n_saved += 1
             con.commit(); con.close()
+            # 마이그레이션 백업 테이블 자동 정리 (저장 정상 완료 시)
+            try:
+                import sqlite3 as _sq2
+                _con2 = _sq2.connect(path)
+                _con2.execute(
+                    "DROP TABLE IF EXISTS eval_target_v1_backup")
+                _con2.commit(); _con2.close()
+            except Exception:
+                pass
             messagebox.showinfo("Saved",
                 f"{n_saved} evaluation target(s) saved.\n{path}")
             self._set_status(
@@ -4989,10 +5008,25 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         """eval_target 행 리스트 → self._pred_targets 적재.
 
         rows 의 각 row 는 (target_id, name, rgb_blob, roi, color, cond_hint).
-        Returns: 적재된 개수
+        Returns: 적재된 개수 (사용자 취소 시 0)
         """
         import pickle as _pk, json as _js
         n_loaded = 0
+        # 메모리에 미저장 target 이 있으면 사용자에게 확인
+        if self._pred_targets:
+            try:
+                ok = messagebox.askyesno(
+                    _L("기존 target 교체",
+                       "Replace existing targets"),
+                    _L(
+                        f"메모리에 {len(self._pred_targets)}개의 평가대상이 있습니다.\n"
+                        f"DB 로드로 모두 교체할까요?\n(취소 시 로드 안 함)",
+                        f"{len(self._pred_targets)} targets in memory.\n"
+                        f"Replace all with DB load?\n(Cancel skips load)"))
+            except Exception:
+                ok = True
+            if not ok:
+                return 0
         # 기존 target 제거
         self._pred_targets.clear()
         self._pred_sel_tid = None
@@ -5963,11 +5997,23 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         except ValueError:
             idx = -1
         used = {x.get("color") for x in self._pred_targets if x is not t}
+        changed = False
         for j in range(1, len(TARGET_COLOR_PALETTE)+1):
             cand = TARGET_COLOR_PALETTE[(idx+j) % len(TARGET_COLOR_PALETTE)]
             if cand not in used:
                 t["color"] = cand
+                changed = True
                 break
+        if not changed:
+            # 모든 색이 사용 중 → 강제 다음 색 (중복 허용) + 사용자 안내
+            next_idx = (idx + 1) % len(TARGET_COLOR_PALETTE)
+            t["color"] = TARGET_COLOR_PALETTE[next_idx]
+            try:
+                self._set_status(_L(
+                    "⚠ 모든 색이 사용 중 — 중복 색으로 변경",
+                    "⚠ All colors in use — duplicated"))
+            except Exception:
+                pass
         self._pred_rebuild_cards()
 
     def _pred_clear_roi(self, tid=None):
@@ -6316,6 +6362,14 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             return
 
         n = len(self._pred_targets)
+        # 분석 시작 — 이전 결과 클리어 (차트 stale 방지)
+        for _t in self._pred_targets:
+            _t["result"] = None
+        try:
+            self._pred_rebuild_cards()
+            self.update_idletasks()
+        except Exception:
+            pass
         for i, t in enumerate(self._pred_targets, start=1):
             self._set_status(
                 _L(f"분석 중 ({i}/{n}): {t.get('name','')[:24]}",
@@ -6425,7 +6479,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         self._pred_run_all()
 
     def _pred_draw_all_charts(self):
-        """모든 target 의 결과를 차트에 동시 표시 (선택된 target 컨텍스트 기반)."""
+        """모든 target 의 결과를 차트에 동시 표시 (선택된 target 컨텍스트 기반).
+        Pseudo-Raman 차트 도 함께 갱신 (m9: stale 방지)."""
         # 선택된 target 의 결과를 메인 ctx 로 사용
         sel = self._pred_get_target_by_tid(self._pred_sel_tid)
         sel_res = sel.get("result") if sel else None
@@ -6450,6 +6505,36 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                             color=SUB, fontsize=8)
                     ax.axis("off")
                     self._pred_figs[key]["cv"].draw()
+
+        # Pseudo-Raman 차트 도 함께 갱신 (선택된 target 기준)
+        try:
+            if getattr(self, "_raman_data", None):
+                # 선택된 target 우선, 없으면 첫 번째 결과 있는 target
+                sel_t = sel
+                if sel_t is None or not sel_t.get("result"):
+                    sel_t = next(
+                        (t for t in self._pred_targets if t.get("result")),
+                        None)
+                if sel_t and sel_t.get("result"):
+                    tm = (sel_t["result"].get("target_metrics")
+                          or sel_t["result"].get("target"))
+                    if tm is not None:
+                        try:
+                            self._run_pseudo_raman_inline(tm)
+                        except Exception:
+                            pass
+                else:
+                    # 분석 결과 없음 — Pseudo 차트 비우기
+                    if hasattr(self, "_pseudo_reg_fig"):
+                        self._pseudo_reg_fig.clear()
+                        if hasattr(self, "_pseudo_reg_cv"):
+                            self._pseudo_reg_cv.draw()
+                    if hasattr(self, "_pseudo_spec_fig"):
+                        self._pseudo_spec_fig.clear()
+                        if hasattr(self, "_pseudo_spec_cv"):
+                            self._pseudo_spec_cv.draw()
+        except Exception:
+            pass
 
     def _run_pseudo_raman_inline(self, target: dict):
         """Pseudo-Raman: 회귀 앙상블 → 추정 스펙트럼. 컨텍스트 _last_eval_ctx에 저장."""
@@ -6823,19 +6908,34 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             ax.fill_between(s1,
                             v_est*(1-band), v_est*(1+band),
                             alpha=0.18, color=sel_color, zorder=2)
+            # 선택된 target 의 곡선만 (다른 target 은 자체 ctx 가 없어
+            # 동일 v_est 표시 시 거짓 표현 — 곡선 overlay 제거)
+            sel_label = (f"T{sel_t.get('tid','?')}"
+                         if sel_t else "Selected")
             ax.plot(s1, v_est, lw=lw, color=sel_color,
-                    alpha=0.85, zorder=3)
+                    alpha=0.85, zorder=3, label=sel_label)
 
-            # ── 모든 target 의 추정 스펙트럼 다중 표시 ──
-            for tt in getattr(self, "_pred_targets", []):
-                if tt is sel_t or not tt.get("result"):
-                    continue
-                # 다른 target 도 스펙트럼이 있으면 표시 (alpha 낮춰)
-                # 비활성 target 은 자체 ctx 가 없으므로, 같은 v_est 로
-                # alpha 낮춰 그리는 정도로만 표시 (근사값)
-                col_t = tt.get("color", ACCENT)
-                ax.plot(s1, v_est, lw=max(0.6,lw*0.5),
-                        color=col_t, alpha=0.30, zorder=2)
+            # ── 다른 target 의 est_peak 위치를 ★ 마커로 표시 ──
+            # (각 target 의 스칼라 est_peak 가 ctx 에 없으므로,
+            #  result 가 있는 target 만 A₁g(337) 위치에 색 마커로 위치 표시)
+            try:
+                a1g_x = 337.0
+                # 선택 target 의 v_est 피크 강도를 기준으로 보조 마커 배치
+                v_max = float(np.max(v_est)) if len(v_est) else 1.0
+                for tt in getattr(self, "_pred_targets", []):
+                    if tt is sel_t or not tt.get("result"):
+                        continue
+                    col_t = tt.get("color", ACCENT)
+                    # 자체 est_peak 가 없으므로 v_max 위치에 ★ 만 표시
+                    # (시각적 위치 = "다른 target 도 결과 있음" 표식)
+                    ax.plot(a1g_x, v_max, marker="*",
+                            markersize=12,
+                            color=col_t, linestyle="None",
+                            markeredgecolor=BORDER,
+                            markeredgewidth=0.5,
+                            zorder=4)
+            except Exception:
+                pass
 
             # 참조선
             ax.annotate(
@@ -6847,7 +6947,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         ax.set_xlabel("Raman Shift (cm⁻¹)", color=SUB, fontsize=fs_a)
         ax.set_ylabel("Intensity (normalized)", color=SUB, fontsize=fs_a)
         ax.set_title(
-            f"Pseudo-Raman Spectrum  (A₁g≈{est_peak:.3f}±{est_se:.3f})",
+            f"Pseudo-Raman Spectrum (selected)  "
+            f"(A₁g≈{est_peak:.3f}±{est_se:.3f})",
             color=TXT, fontsize=fs_t)
         # 차트 내 범례 생략 (카드 색상 표시가 범례)
         fig.tight_layout(pad=0.6)
