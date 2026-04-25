@@ -1124,7 +1124,40 @@ def db_load_all(path: str) -> list:
 
 
 # ══════════════════════════════════════════════
-#  4. ROI 선택 팝업 (드래그 이동 + 복사 지원)
+#  4. 사용자 설정 (API 키 등) 영구 저장
+# ══════════════════════════════════════════════
+def _settings_dir() -> str:
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "hfs2_analyzer")
+    return os.path.join(os.path.expanduser("~"), ".config", "hfs2_analyzer")
+
+
+def _settings_path() -> str:
+    return os.path.join(_settings_dir(), "settings.json")
+
+
+def load_settings() -> dict:
+    try:
+        with open(_settings_path(), encoding="utf-8") as f:
+            data = _json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, OSError, ValueError):
+        return {}
+
+
+def save_settings(data: dict) -> bool:
+    try:
+        os.makedirs(_settings_dir(), exist_ok=True)
+        with open(_settings_path(), "w", encoding="utf-8") as f:
+            _json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+# ══════════════════════════════════════════════
+#  5. ROI 선택 팝업 (드래그 이동 + 복사 지원)
 # ══════════════════════════════════════════════
 class ROISelector(tk.Toplevel):
     """
@@ -1506,6 +1539,7 @@ class App(_Base):
             ("Al₂O₃-70%", COND_COLORS[3]),
         ]
 
+        self._settings = load_settings()
         self._build()
         self.bind_all("<Control-v>", lambda e: self._paste())
         self.bind_all("<Control-V>", lambda e: self._paste())
@@ -8030,7 +8064,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         self._api_key_frame.pack(side="left", padx=4)
         tk.Label(self._api_key_frame, text="API Key:",
                  bg=PANEL2, fg=SUB, font=LF).pack(side="left")
-        self._api_key_var = tk.StringVar()
+        _saved_key = self._settings.get("claude_api_key", "")
+        self._api_key_var = tk.StringVar(value=_saved_key)
         self._api_key_entry = tk.Entry(
             self._api_key_frame,
             textvariable=self._api_key_var,
@@ -8039,6 +8074,15 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             relief="flat", show="*",
             highlightbackground=BORDER, highlightthickness=1)
         self._api_key_entry.pack(side="left", padx=4, pady=5)
+        # 키 저장 체크박스 — ON 이면 settings.json 에 평문 저장
+        self._api_key_save_var = tk.BooleanVar(value=bool(_saved_key))
+        tk.Checkbutton(
+            self._api_key_frame, text=_L("저장","Save"),
+            variable=self._api_key_save_var,
+            bg=PANEL2, fg=SUB, selectcolor=PANEL2,
+            activebackground=PANEL2, font=LF,
+            command=self._on_api_key_save_toggle,
+        ).pack(side="left", padx=2)
         # 초기에는 숨김 (로컬 모드 기본)
         self._api_key_frame.pack_forget()
 
@@ -9604,6 +9648,11 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                     _L("API 키 필요","API Key Required"),
                     "Enter your Claude API key.\n\nWithout an API key, use [📊 Local Stats] mode.")
                 return
+            # 저장 체크박스 ON 이면 현재 키를 settings 에 갱신
+            if self._api_key_save_var.get():
+                if self._settings.get("claude_api_key") != api_key:
+                    self._settings["claude_api_key"] = api_key
+                    save_settings(self._settings)
             self._ai_set_text("⏳ Calling Claude API...")
             self.update_idletasks()
             import threading
@@ -9618,51 +9667,63 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 target=self._local_analysis,
                 args=(an, rd), daemon=True).start()
 
-    def _call_claude_api(self, an: list, rd: list, api_key: str = ""):
-        """Claude API 호출 (별도 스레드)"""
-        try:
-            # 데이터 요약 생성
-            def df(d):
-                try: return float(d)
-                except: return 9999
+    def _on_api_key_save_toggle(self):
+        """API 키 저장 체크박스 토글 — ON 이면 즉시 저장, OFF 이면 저장된 키 제거"""
+        if self._api_key_save_var.get():
+            key = self._api_key_var.get().strip()
+            if key:
+                self._settings["claude_api_key"] = key
+                if save_settings(self._settings):
+                    self._set_status(_L("✓ API 키 저장됨", "✓ API key saved"))
+                else:
+                    self._set_status(_L("⚠ API 키 저장 실패", "⚠ API key save failed"))
+        else:
+            if "claude_api_key" in self._settings:
+                self._settings.pop("claude_api_key", None)
+                save_settings(self._settings)
+                self._set_status(_L("✓ 저장된 API 키 제거됨", "✓ Saved API key removed"))
 
-            conds = list(dict.fromkeys(
-                [img["cond"] for img in an]+[r["cond"] for r in rd]))
+    def _build_data_summary(self, an: list, rd: list) -> str:
+        """이미지 + Raman 데이터를 LLM 입력용 텍스트로 요약"""
+        def df(d):
+            try: return float(d)
+            except: return 9999
 
-            summary_lines = []
-            for cond in conds:
-                imgs_c = sorted([img for img in an if img["cond"]==cond],
-                                key=lambda x:df(x["day"]))
-                rams_c = sorted([r for r in rd if r["cond"]==cond],
-                                key=lambda x:df(x["day"]))
+        conds = list(dict.fromkeys(
+            [img["cond"] for img in an] + [r["cond"] for r in rd]))
 
-                img_rows=[]
-                for img in imgs_c:
-                    b=img["lab"]["b"]; s=img["s_mean"]
-                    yi=img.get("yellowness_idx",np.nan)
-                    de=img.get("delta_e",np.nan)
-                    img_rows.append(
-                        f"  day={img['day']}: b*={b:.1f}, S={s:.1f}, "
-                        f"YI={yi:.0f}, ΔE={de:.1f}"
-                        if not np.isnan(de) else
-                        f"  day={img['day']}: b*={b:.1f}, S={s:.1f}, YI={yi:.0f}")
-                ram_rows=[
-                    f"  day={r['day']}: 피크={r['peak']:.4f} "
-                    f"(norm={r.get('norm_peak',np.nan):.3f})"
-                    for r in rams_c]
+        summary_lines = []
+        for cond in conds:
+            imgs_c = sorted([img for img in an if img["cond"] == cond],
+                            key=lambda x: df(x["day"]))
+            rams_c = sorted([r for r in rd if r["cond"] == cond],
+                            key=lambda x: df(x["day"]))
 
-                summary_lines.append(
-                    f"[Condition: {cond}]\n"
-                    f"Image metrics:\n"+"\n".join(img_rows)+"\n"
-                    f"Raman peaks:\n"+"\n".join(ram_rows))
+            img_rows = []
+            for img in imgs_c:
+                b = img["lab"]["b"]; s = img["s_mean"]
+                yi = img.get("yellowness_idx", np.nan)
+                de = img.get("delta_e", np.nan)
+                img_rows.append(
+                    f"  day={img['day']}: b*={b:.1f}, S={s:.1f}, "
+                    f"YI={yi:.0f}, ΔE={de:.1f}"
+                    if not np.isnan(de) else
+                    f"  day={img['day']}: b*={b:.1f}, S={s:.1f}, YI={yi:.0f}")
+            ram_rows = [
+                f"  day={r['day']}: 피크={r['peak']:.4f} "
+                f"(norm={r.get('norm_peak', np.nan):.3f})"
+                for r in rams_c]
 
-            data_summary = "\n\n".join(summary_lines)
+            summary_lines.append(
+                f"[Condition: {cond}]\n"
+                f"Image metrics:\n" + "\n".join(img_rows) + "\n"
+                f"Raman peaks:\n" + "\n".join(ram_rows))
 
-            prompt = f"""당신은 HfS₂ 박막 산화도 분석 전문가이다.
-아래는 여러 조건과 날짜에 걸쳐 측정된 HfS₂ 시편의 이미지 분석 지표와 Raman 분광 데이터이다.
+        return "\n\n".join(summary_lines)
 
-=== 측정 데이터 ===
-{data_summary}
+    # 캐싱되는 정적 system prompt — 매 요청마다 동일
+    _CLAUDE_SYSTEM_PROMPT = """당신은 HfS₂ 박막 산화도 분석 전문가이다.
+사용자가 제공하는 이미지 분석 지표와 Raman 분광 데이터를 바탕으로 산화도를 평가한다.
 
 === 지표 설명 ===
 - b* (Lab 황색도): 미산화 시편 +40~60, 완전 산화 시 +5~15. 감소할수록 산화 진행.
@@ -9671,8 +9732,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
 - ΔE: 0일 기준 색차. 값이 클수록 색 변화 큼.
 - Raman A₁g 피크: HfS₂ 고유 진동 모드. 산화 시 소멸.
 
-=== 분석 요청 ===
-다음 내용을 한국어로 3~5문장으로 분석해해야 한다:
+=== 분석 요청 형식 ===
+사용자 데이터를 보고 다음 내용을 한국어로 3~5문장으로 분석한다:
 1. 조건별 산화 진행 속도 비교 (빠른 순서 명시)
 2. 이미지 지표(b*, S, YI)와 Raman 피크 감소 간의 일치/불일치 여부
 3. 어떤 이미지 지표가 Raman과 가장 높은 상관관계를 보이는지
@@ -9680,41 +9741,77 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
 
 간결하고 핵심만 담아 연구자가 바로 보고서에 활용할 수 있는 수준으로 작성한다."""
 
-            import urllib.request, json as _json
-            payload = _json.dumps({
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1000,
-                "messages": [{"role":"user","content":prompt}]
-            }).encode()
+    def _call_claude_api(self, an: list, rd: list, api_key: str = ""):
+        """Claude API 호출 (별도 스레드). anthropic SDK + prompt caching 사용."""
+        try:
+            try:
+                import anthropic
+            except ImportError:
+                self.after(0, lambda: self._ai_set_text(
+                    "anthropic SDK 가 설치되지 않았습니다.\n\n"
+                    "터미널에서 다음 명령으로 설치:\n"
+                    "    pip install anthropic\n\n"
+                    "또는 [📊 Local Stats] 모드를 사용하세요."))
+                self.after(0, lambda: self._set_status(_L("⚠ anthropic 미설치", "⚠ anthropic not installed")))
+                return
 
-            req = urllib.request.Request(
-                "https://api.anthropic.com/v1/messages",
-                data=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "anthropic-version": "2023-06-01",
-                    "x-api-key": api_key,
-                })
+            data_summary = self._build_data_summary(an, rd)
+            user_msg = f"=== 측정 데이터 ===\n{data_summary}"
 
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = _json.loads(resp.read())
-                text = result["content"][0]["text"]
+            client = anthropic.Anthropic(api_key=api_key)
+            response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1024,
+                system=[{
+                    "type": "text",
+                    "text": self._CLAUDE_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[{"role": "user", "content": user_msg}],
+            )
+
+            text = next((b.text for b in response.content if b.type == "text"), "")
+            if not text:
+                text = "(응답에 텍스트 블록이 없습니다.)"
+
+            # 캐시 사용량 표시 (디버깅 / 비용 가시화)
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                cr = getattr(usage, "cache_read_input_tokens", 0) or 0
+                cw = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                if cr or cw:
+                    text = text + f"\n\n[cache: read={cr} write={cw} tokens]"
 
             self.after(0, lambda: self._ai_set_text(text))
-            self.after(0, lambda: self._set_status(_L("✓ AI 분석 완료","✓ AI analysis complete")))
+            self.after(0, lambda: self._set_status(_L("✓ AI 분석 완료", "✓ AI analysis complete")))
 
-        except urllib.error.HTTPError as e:
-            err_msg = f"API Error (HTTP {e.code})"
-            if e.code == 401:
-                err_msg += "\n\nInvalid API key. Please check your key."
-            elif e.code == 429:
-                err_msg += "\n\nRate limit exceeded. Please retry later."
-            self.after(0, lambda m=err_msg: self._ai_set_text(m))
-            self.after(0, lambda: self._set_status(_L("⚠ API 호출 실패","⚠ API call failed")))
+        except anthropic.AuthenticationError:
+            self.after(0, lambda: self._ai_set_text(
+                "API 키가 유효하지 않습니다.\n\n"
+                "console.anthropic.com 에서 키를 확인하세요."))
+            self.after(0, lambda: self._set_status(_L("⚠ 인증 실패", "⚠ Auth failed")))
+        except anthropic.RateLimitError:
+            self.after(0, lambda: self._ai_set_text(
+                "API 호출 한도 초과 (Rate limit).\n\n"
+                "잠시 후 재시도하거나 [📊 Local Stats] 모드를 사용하세요."))
+            self.after(0, lambda: self._set_status(_L("⚠ 한도 초과", "⚠ Rate limit")))
+        except anthropic.NotFoundError:
+            self.after(0, lambda: self._ai_set_text(
+                "모델을 찾을 수 없습니다 (404). 모델 ID 가 변경되었을 수 있습니다.\n\n"
+                "코드의 model='claude-sonnet-4-6' 부분을 최신 모델 ID 로 업데이트하세요."))
+            self.after(0, lambda: self._set_status(_L("⚠ 모델 없음", "⚠ Model not found")))
+        except anthropic.APIConnectionError:
+            self.after(0, lambda: self._ai_set_text(
+                "네트워크 연결 오류. 인터넷 연결을 확인하세요."))
+            self.after(0, lambda: self._set_status(_L("⚠ 연결 실패", "⚠ Connection failed")))
+        except anthropic.APIStatusError as e:
+            err = f"API 오류 (HTTP {e.status_code}): {e.message}"
+            self.after(0, lambda m=err: self._ai_set_text(m))
+            self.after(0, lambda: self._set_status(_L("⚠ API 오류", "⚠ API error")))
         except Exception as ex:
             self.after(0, lambda m=str(ex): self._ai_set_text(
-                f"Error: {m}\n\nSwitch to [📊 Local Stats] mode and retry."))
-            self.after(0, lambda: self._set_status(_L("⚠ API 호출 실패","⚠ API call failed")))
+                f"예상치 못한 오류: {m}\n\n[📊 Local Stats] 모드로 전환 후 재시도하세요."))
+            self.after(0, lambda: self._set_status(_L("⚠ API 호출 실패", "⚠ API call failed")))
 
     def _local_analysis(self, an: list, rd: list):
         """로컬 통계 기반 텍스트 분석 — 한/영 지원"""
