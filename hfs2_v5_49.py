@@ -369,28 +369,38 @@ def roi_to_mask(shape, roi):
 def auto_detect_roi(rgb: np.ndarray,
                     paper_v_thresh: int = 215,
                     paper_s_thresh: int = 25,
-                    erosion_ratio: float = 0.06,
+                    target_area_ratio: float = 0.22,
+                    max_specimen_fraction: float = 0.80,
+                    edge_margin_ratio: float = 0.05,
                     min_area_ratio: float = 0.05,
                     paper_inside_ratio: float = 0.02) -> tuple:
     """
     HfS₂ 시편 사진에서 자동 ROI 추정.
 
-    알고리즘 (off-center 허용, paper 강력 회피, 시편 모양에 자동 fit):
-    1) HSV V/S 임계로 paper 마스크 추출
-    2) non_paper 마스크 형태학 정리 (open + close)
-    3) **erosion** — paper 경계의 그림자/anti-aliasing 픽셀이 ROI 에 들어오지
-       않도록 마스크를 안쪽으로 erosion_ratio 만큼 깎아냄
-    4) erosion 결과의 가장 큰 컴포넌트의 bounding box = ROI
-       → 시편이 한쪽으로 치우쳐 있으면 ROI 도 그쪽으로 치우침 (비대칭)
-       → 시편이 가로로 길면 ROI 도 가로로 길게 (모양 자동 fit)
+    DB pkw_1.db 의 사용자 패턴에 맞춤:
+      - ROI 면적 ≈ 이미지의 22% (DB 평균 23.8%)
+      - ROI 중심 ≈ 시편 bbox 중심 (대략 이미지 중심부)
+      - 가로/세로 비 = 시편 bbox 비율 (시편이 가로로 길면 ROI 도 가로)
+      - 이미지 가장자리에 닿지 않게 안전 margin 보장
 
-    중심 가정 X. erosion 이 paper 거리만큼 안쪽으로 들어가므로 별도 margin 불필요.
-    erosion 이 너무 강하면 자동으로 약하게 재시도.
+    알고리즘:
+    1) HSV V/S 로 paper 마스크 추출
+    2) non_paper 형태학 정리 (open + close)
+    3) 가장 큰 contour 의 bbox = 시편 bbox (sx, sy, sbw, sbh)
+    4) 목표 ROI 너비/높이 산출:
+         - target_area = img_area * target_area_ratio
+         - aspect = sbw / sbh (시편 가로/세로 비)
+         - roi_w = sqrt(target_area * aspect)
+         - roi_h = sqrt(target_area / aspect)
+       단, ROI 가 시편 bbox 의 max_specimen_fraction (80%) 보다 크면 캡
+    5) ROI 중심 = 시편 bbox 중심
+    6) edge_margin_ratio (5%) 안쪽으로 밀어넣기 — 가장자리 안전 보장
+    7) 품질 평가: 면적 / 가장자리 근접 / paper 비율
 
     Returns
     -------
     roi    : (x0, y0, x1, y1)
-    flag   : 'good' | 'warn_small' | 'warn_paper' | 'failed'
+    flag   : 'good' | 'warn_small' | 'warn_off' | 'warn_paper' | 'failed'
     reason : 한 줄 한국어 설명
     """
     h, w = rgb.shape[:2]
@@ -404,7 +414,7 @@ def auto_detect_roi(rgb: np.ndarray,
         paper = (V > paper_v_thresh) & (S < paper_s_thresh)
         non_paper = (~paper).astype(np.uint8) * 255
 
-        # 형태학 정리 — 점·노이즈 제거 + 시편 내부 작은 구멍 메우기
+        # 형태학 정리
         k_clean = max(7, min(h, w) // 80)
         if k_clean % 2 == 0:
             k_clean += 1
@@ -412,38 +422,68 @@ def auto_detect_roi(rgb: np.ndarray,
         non_paper = cv2.morphologyEx(non_paper, cv2.MORPH_OPEN, kern)
         non_paper = cv2.morphologyEx(non_paper, cv2.MORPH_CLOSE, kern)
 
-        # Erosion — paper 경계 그림자/anti-aliasing 회피
-        # 자동 약화: 너무 erode 하면 contour 사라짐 → 단계적으로 줄임
-        for ratio in (erosion_ratio, erosion_ratio * 0.6, erosion_ratio * 0.3):
-            ek_size = max(7, int(min(h, w) * ratio))
-            if ek_size % 2 == 0:
-                ek_size += 1
-            ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ek_size, ek_size))
-            eroded = cv2.erode(non_paper, ek)
-            contours, _ = cv2.findContours(
-                eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                c = max(contours, key=cv2.contourArea)
-                if cv2.contourArea(c) > 100:
-                    break
-        else:
+        contours, _ = cv2.findContours(
+            non_paper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
             return default_roi, "failed", "시편 영역을 찾지 못함 — 수동 설정 필요"
-
-        x, y, bw, bh = cv2.boundingRect(c)
-        if bw < 10 or bh < 10:
+        c = max(contours, key=cv2.contourArea)
+        sx, sy, sbw, sbh = cv2.boundingRect(c)
+        if sbw < 10 or sbh < 10:
             return default_roi, "failed", "시편 영역이 너무 작음"
 
-        x0 = max(0, int(x))
-        y0 = max(0, int(y))
-        x1 = min(w, int(x + bw))
-        y1 = min(h, int(y + bh))
-        roi = (x0, y0, x1, y1)
+        # 목표 ROI 크기 — DB 패턴 면적 + 시편 모양 비율
+        target_area = img_area * target_area_ratio
+        aspect = sbw / sbh if sbh > 0 else 1.0
+        roi_w = int((target_area * aspect) ** 0.5)
+        roi_h = int((target_area / aspect) ** 0.5)
+        # 시편 bbox 보다 크지 않게 캡
+        roi_w = min(roi_w, int(sbw * max_specimen_fraction))
+        roi_h = min(roi_h, int(sbh * max_specimen_fraction))
+        # 너무 작아지면 최소 보장
+        roi_w = max(roi_w, int(min(w, sbw) * 0.20))
+        roi_h = max(roi_h, int(min(h, sbh) * 0.20))
 
-        # 품질 평가 — 중앙 편향 검사 없음 (off-center OK)
+        # ROI 중심 = 시편 bbox 중심
+        cx = sx + sbw / 2
+        cy = sy + sbh / 2
+
+        # 가장자리 안전 margin — 안쪽으로 밀어넣기
+        margin_x = int(w * edge_margin_ratio)
+        margin_y = int(h * edge_margin_ratio)
+
+        x0 = int(cx - roi_w / 2)
+        y0 = int(cy - roi_h / 2)
+        x1 = x0 + roi_w
+        y1 = y0 + roi_h
+        if x0 < margin_x:
+            shift = margin_x - x0
+            x0 += shift; x1 += shift
+        if x1 > w - margin_x:
+            shift = x1 - (w - margin_x)
+            x0 -= shift; x1 -= shift
+        if y0 < margin_y:
+            shift = margin_y - y0
+            y0 += shift; y1 += shift
+        if y1 > h - margin_y:
+            shift = y1 - (h - margin_y)
+            y0 -= shift; y1 -= shift
+        # 안전 clamp
+        x0 = max(0, x0); y0 = max(0, y0)
+        x1 = min(w, x1); y1 = min(h, y1)
+        if x1 <= x0 + 1 or y1 <= y0 + 1:
+            return default_roi, "failed", "ROI 너비/높이 0"
+        roi = (int(x0), int(y0), int(x1), int(y1))
+
+        # 품질 평가
         roi_area = (x1 - x0) * (y1 - y0)
         area_ratio = roi_area / img_area
         if area_ratio < min_area_ratio:
             return roi, "warn_small", f"ROI 면적 작음 ({area_ratio*100:.0f}%)"
+        # 가장자리 너무 가까운지 (margin 의 절반 이내) — 시편이 가장자리에 있으면 위험
+        edge_warn = (x0 < margin_x * 0.5 or y0 < margin_y * 0.5 or
+                     x1 > w - margin_x * 0.5 or y1 > h - margin_y * 0.5)
+        if edge_warn:
+            return roi, "warn_off", "ROI 가 이미지 가장자리에 가까움 — 시편 위치 확인 필요"
         roi_paper = paper[y0:y1, x0:x1]
         paper_in_roi = float(roi_paper.mean()) if roi_paper.size > 0 else 0.0
         if paper_in_roi > paper_inside_ratio:
@@ -457,10 +497,10 @@ def evaluate_roi_quality(rgb: np.ndarray, roi: tuple,
                          paper_v_thresh: int = 215,
                          paper_s_thresh: int = 25,
                          min_area_ratio: float = 0.05,
+                         edge_margin_ratio: float = 0.025,
                          paper_inside_ratio: float = 0.02) -> tuple:
     """주어진 ROI 에 대해 품질만 평가 (자동 추정 X — DB 로드 등에 사용).
-    중앙 편향 검사는 제거 (off-center OK — 사용자 정책).
-    Returns (flag, reason) — flag ∈ good / warn_small / warn_paper / failed
+    Returns (flag, reason) — flag ∈ good / warn_small / warn_off / warn_paper / failed
     """
     if rgb is None or roi is None:
         return "failed", "이미지 또는 ROI 없음"
@@ -473,6 +513,11 @@ def evaluate_roi_quality(rgb: np.ndarray, roi: tuple,
     area_ratio = roi_area / img_area
     if area_ratio < min_area_ratio:
         return "warn_small", f"ROI 면적 작음 ({area_ratio*100:.0f}%)"
+    # 가장자리 근접 검사 — ROI 가 이미지 끝에 닿으면 잘못 설정
+    margin_x = int(w * edge_margin_ratio)
+    margin_y = int(h * edge_margin_ratio)
+    if x0 < margin_x or y0 < margin_y or x1 > w - margin_x or y1 > h - margin_y:
+        return "warn_off", "ROI 가 이미지 가장자리에 가까움 — 시편 위치 확인 필요"
     try:
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         paper = (hsv[:, :, 2] > paper_v_thresh) & (hsv[:, :, 1] < paper_s_thresh)
@@ -555,7 +600,7 @@ _ROI_FLAG_LABEL = {
     "manual":     ("✓", "사용자 확인", "Manual"),
     "good":       ("✓", "자동 OK",     "Auto OK"),
     "warn_small": ("⚠", "면적 작음",   "Too small"),
-    "warn_off":   ("⚠", "한쪽 치우침", "Off-center"),
+    "warn_off":   ("⚠", "끝쪽 설정",   "Near edge"),
     "warn_paper": ("⚠", "배경 포함",   "Includes paper"),
     "failed":     ("✗", "추정 실패",   "Detection failed"),
 }
