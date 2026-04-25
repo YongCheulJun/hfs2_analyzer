@@ -2079,10 +2079,10 @@ class App(_Base):
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=6, pady=5)
 
-        # 좌: 이미지 목록
+        # 좌: 이미지 목록 (사용자 요청 — 더 크게)
         left = tk.Frame(body, bg=PANEL,
                         highlightbackground=BORDER, highlightthickness=1,
-                        width=320)
+                        width=440)
         left.pack(side="left", fill="y", padx=(0,5))
         left.pack_propagate(False)
         self._build_list_panel(left)
@@ -11818,9 +11818,15 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
     # ─────────────────────────────────────────
     #  목록 재빌드
     # ─────────────────────────────────────────
+    # 카드 썸네일 사이즈 (사용자 요청 — 더 크게)
+    _CARD_THUMB_W = 96
+    _CARD_THUMB_H = 80
+
     def _rebuild_list(self):
         for w in self._lf.winfo_children():
             w.destroy()
+        # 카드 frame 참조 캐시 — 선택 변경 시 _refresh_card_border 에 사용
+        self._cards_by_idx = {}
 
         total = len(self.images)
         done  = sum(1 for img in self.images if img.get("roi"))
@@ -11874,6 +11880,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                             highlightthickness=thick,
                             cursor="hand2")
             card.pack(fill="x", padx=5, pady=3)
+            self._cards_by_idx[idx] = card
             # 일관성 점검 결과 카드에 보존 (ROI 라벨에서 사용)
             img["_roi_inconsistent"] = inconsistent
             img["_roi_group_iou"] = group_iou
@@ -11884,8 +11891,18 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
 
             th = img.get("thumb")
             if th:
-                tk_img = ImageTk.PhotoImage(
-                    th.resize((62,52), Image.LANCZOS))
+                # PhotoImage 캐시 — 같은 thumb 객체면 재사용 (resize 비용 절감)
+                cached = img.get("_tk_thumb_cache")
+                if (cached is not None
+                        and cached[0] is th
+                        and cached[1] == (self._CARD_THUMB_W, self._CARD_THUMB_H)):
+                    tk_img = cached[2]
+                else:
+                    tk_img = ImageTk.PhotoImage(
+                        th.resize((self._CARD_THUMB_W, self._CARD_THUMB_H),
+                                  Image.LANCZOS))
+                    img["_tk_thumb_cache"] = (
+                        th, (self._CARD_THUMB_W, self._CARD_THUMB_H), tk_img)
                 self._refs[f"li_{idx}"] = tk_img
                 lbl = tk.Label(top, image=tk_img,
                                bg=card["bg"], cursor="hand2")
@@ -11893,7 +11910,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 lbl.bind("<Button-1>", lambda e,i=idx: self._select(i))
             else:
                 tk.Label(top, text="📷", bg=card["bg"],
-                         fg=SUB, font=("Segoe UI",18),
+                         fg=SUB, font=("Segoe UI",24),
                          width=5).pack(side="left", padx=(0,5))
 
             flds = tk.Frame(top, bg=card["bg"])
@@ -13763,9 +13780,64 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
     # ─────────────────────────────────────────
     #  선택/동기화/유틸
     # ─────────────────────────────────────────
+    def _refresh_card_border(self, idx):
+        """카드 테두리/배경만 갱신 — 선택 변경 시 사용 (전체 재빌드 회피)."""
+        cards = getattr(self, "_cards_by_idx", None)
+        if not cards or idx is None or idx not in cards:
+            return
+        card = cards[idx]
+        try:
+            if not card.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if idx < 0 or idx >= len(self.images):
+            return
+        img = self.images[idx]
+        is_sel = (idx == self.sel_idx)
+        has_roi = img.get("roi") is not None
+        roi_flag = img.get("roi_flag")
+        inconsistent = bool(img.get("_roi_inconsistent", False))
+        if is_sel:
+            brd = ACCENT
+        else:
+            brd = _border_color_for_roi(roi_flag, has_roi,
+                {"green": GREEN, "amber": AMBER, "red": RED,
+                 "purple": PURPLE, "border": BORDER},
+                inconsistent=inconsistent)
+        thick = 2 if (is_sel
+                      or roi_flag in ("warn_small", "warn_off", "warn_paper", "failed")
+                      or (inconsistent and roi_flag != "failed"
+                          and roi_flag not in ("warn_small", "warn_off", "warn_paper"))) else 1
+        new_bg = CARD2 if is_sel else CARD
+        try:
+            card.configure(bg=new_bg, highlightbackground=brd,
+                           highlightthickness=thick)
+            # 자식 위젯의 bg 도 카드와 일치하도록 재귀 (CARD/CARD2 만 교체)
+            def _update_bg(w):
+                try:
+                    cur = w.cget("bg")
+                    if cur in (CARD, CARD2):
+                        w.configure(bg=new_bg)
+                except tk.TclError:
+                    pass
+                for c in w.winfo_children():
+                    _update_bg(c)
+            _update_bg(card)
+        except tk.TclError:
+            pass
+
     def _select(self, idx):
-        self.sel_idx=idx
-        self._rebuild_list()
+        old = self.sel_idx
+        self.sel_idx = idx
+        # 전체 재빌드 대신 두 카드(이전/현재) 의 테두리만 갱신 — 빠름
+        try:
+            if old != idx and old is not None and old >= 0:
+                self._refresh_card_border(old)
+            self._refresh_card_border(idx)
+        except Exception:
+            # 카드 캐시 없거나 stale 이면 안전 폴백
+            self._rebuild_list()
         self._refresh_orig()
         self._refresh_hsi()
         self._update_table()
