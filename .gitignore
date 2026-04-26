@@ -22,8 +22,18 @@ settings_v*.json
 *.png
 *.jpg
 *.jpeg
+*.pptx
+*.ppt
+*.pdf
+*.docx
+*.xlsx
 data/
 samples/
+
+# 사용자 데이터 폴더 (시편 사진/문헌/DB 원본 — 외부 공개 금지)
+newfiles/
+dbfiles/
+pkw_papers/
 
 # IDE
 .vscode/
