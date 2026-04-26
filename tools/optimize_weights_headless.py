@@ -8,9 +8,13 @@ estimate (KNN/Wass/FFT/Spatial/Kinetic) → optimize_advanced_weights →
 RMSE 최소화 가중치.
 
 사용법:
-  MPLBACKEND=Agg python3 tools/optimize_weights_headless.py
+  MPLBACKEND=Agg python3 tools/optimize_weights_headless.py \
+      [--pool POOL.db] [--targets DIR]
+  기본: --pool pkw_1.db --targets newfiles/output/sample
 """
 from __future__ import annotations
+
+import argparse
 
 import os
 import re
@@ -156,9 +160,24 @@ def stem(s: str) -> str:
 
 
 def main():
-    db_path = os.path.join(
-        ROOT, "newfiles/output/output_cut/db/pkw_1.db")
-    sample_dir = os.path.join(ROOT, "newfiles/output/sample")
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--pool",
+        default=os.path.join(
+            ROOT, "newfiles/output/output_cut/db/pkw_1.db"),
+        help="분석대상 pool DB 경로")
+    ap.add_argument(
+        "--targets",
+        default=os.path.join(ROOT, "newfiles/output/sample"),
+        help="평가대상 이미지 폴더")
+    ap.add_argument(
+        "--save", action="store_true",
+        help="최적 가중치를 settings.json adv_weights 에 저장 "
+             "(다음 GUI 분석부터 자동 적용)")
+    args = ap.parse_args()
+
+    db_path    = args.pool
+    sample_dir = args.targets
 
     print(f"[load] DB: {db_path}")
     pool = db_load_all(db_path)
@@ -304,6 +323,16 @@ def main():
         print(f"\n[skipped {len(skipped)}]")
         for fn, why in skipped[:10]:
             print(f"  {fn}: {why}")
+
+    if args.save:
+        from hfs2_v5_49 import load_settings, save_settings, _settings_path
+        settings = load_settings()
+        settings["adv_weights"] = opt["weights"]
+        ok = save_settings(settings)
+        if ok:
+            print(f"\n[save] adv_weights → {_settings_path()}")
+        else:
+            print("\n[save] FAILED — settings.json write error")
 
 
 if __name__ == "__main__":
