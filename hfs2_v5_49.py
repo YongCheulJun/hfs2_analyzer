@@ -7288,7 +7288,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                       f"{best_img.get('day','?')}d"
                       if best_img else "—")
 
-        return {
+        result = {
             "target_metrics": target,
             "scores":         scores,
             "top":            top,
@@ -7298,6 +7298,77 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             "best_dist":      best_dist,
             "pool_cond":      pool_cond,
             "cond_input":     cond_input,
+        }
+
+        # Advanced 분석 추가 — 5 methods + ensemble (saved weights 적용)
+        try:
+            adv_res = self._compute_advanced_for_target(
+                target, pool_cond, est_day, confidence)
+            result["adv"] = adv_res
+        except Exception as ex:
+            print(f"[pred-adv] target adv failed: "
+                  f"{type(ex).__name__}: {ex}")
+            result["adv"] = None
+
+        return result
+
+    def _compute_advanced_for_target(self, target: dict, pool: list,
+                                      knn_day, knn_conf) -> dict:
+        """평가대상 1개 + 분석대상 pool → Wass/FFT/Spatial/Kinetic +
+        Ensemble 결과 반환. KNN 은 _pred_compute_one 결과를 그대로 사용.
+
+        반환: {knn, wass, fft, spatial, kinetic 각각 (day, conf),
+               ens_day, ens_conf, weights}
+        """
+        rgb  = target.get("rgb")
+        mask = target.get("mask")
+        if rgb is None or mask is None:
+            return None
+        roi = target.get("roi",
+                         (0, 0, rgb.shape[1], rgb.shape[0]))
+        rows = self.cfg_rows.get() if hasattr(self, "cfg_rows") else 3
+        cols = self.cfg_cols.get() if hasattr(self, "cfg_cols") else 3
+
+        adv_precompute_pool(pool, rows=rows, cols=cols)
+
+        t_hist    = adv_hist_signature(rgb, mask)
+        t_fft     = adv_fft_features(rgb, mask)
+        t_spatial = adv_spatial_features(rgb, mask, roi, rows, cols)
+        try:
+            kp = adv_kinetic_fit(pool)
+        except Exception:
+            kp = {}
+
+        w_res = adv_wasserstein_estimate(t_hist, pool)
+        f_res = adv_fft_estimate(t_fft, pool)
+        s_res = adv_spatial_estimate(t_spatial, pool, rows, cols)
+        t_b = target.get("lab", {}).get("b", np.nan)
+        k_res = adv_kinetic_estimate(t_b, kp, target.get("cond", ""))
+
+        saved_w = None
+        try:
+            saved_w = load_settings().get("adv_weights")
+        except Exception:
+            pass
+
+        ens = adv_ensemble(
+            knn_day, knn_conf,
+            w_res["est_day"], w_res["confidence"],
+            f_res["est_day"], f_res["confidence"],
+            s_res["est_day"], s_res["confidence"],
+            k_res["est_day"], k_res["confidence"],
+            prior_weights=saved_w,
+        )
+
+        return {
+            "knn":     (knn_day,           knn_conf),
+            "wass":    (w_res["est_day"],  w_res["confidence"]),
+            "fft":     (f_res["est_day"],  f_res["confidence"]),
+            "spatial": (s_res["est_day"],  s_res["confidence"]),
+            "kinetic": (k_res["est_day"],  k_res["confidence"]),
+            "ens_day":  ens["est_day"],
+            "ens_conf": ens["confidence"],
+            "weights":  ens["weights"],
         }
 
     def _pred_run_all(self):
@@ -8938,60 +9009,116 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         }
 
     def _adv_optimize_weights(self):
-        """🎯 라만 매칭된 이미지를 ground truth 로 ensemble weight 최적화.
+        """🎯 평가대상 ↔ 분석대상 매칭으로 ensemble weight 최적화.
 
-        leave-one-out 평가 후 RMSE 최소화 가중치를 settings.json
-        ("adv_weights" 키) 에 저장. 이후 Advanced 분석은 이 가중치 사용.
+        Workflow:
+          1) 같은 DB 이미지를 [분석대상] 과 [평가대상] 양쪽에 입력.
+          2) 각 평가대상의 name 을 분석대상 self.images 에서 매칭 (또는
+             cond+day 매칭) — 분석대상의 day 가 ground truth.
+          3) 평가대상 query → 분석대상 pool (자기 매칭 제외) →
+             5 methods (KNN/Wass/FFT/Spatial/Kinetic) estimate 수집.
+          4) RMSE 최소화 weight 학습 → settings.json["adv_weights"] 저장.
+          5) 다음부터 _pred_compute_one 의 ensemble 에 자동 적용.
         """
-        # ground truth subset
-        gt_imgs = []
-        for img in self.images:
-            if img.get("raman_id") is None:
-                continue
-            if img.get("rgb") is None or img.get("mask") is None:
+        if not self._pred_targets:
+            messagebox.showwarning(
+                _L("평가대상 없음", "No evaluation targets"),
+                _L("먼저 평가대상 이미지를 추가하세요.\n"
+                   "(분석대상 DB 와 같은 이미지들을 평가대상 탭에 추가)",
+                   "Add evaluation targets first.\n"
+                   "(Add the same images as the analyzed DB)"))
+            return
+        if not self.images:
+            messagebox.showwarning(
+                _L("분석대상 없음", "No analyzed images"),
+                _L("먼저 분석대상 DB (예: pkw_1.db) 를 LOAD 하세요.",
+                   "LOAD an analyzed DB (e.g., pkw_1.db) first."))
+            return
+
+        # 평가대상 → 분석대상 매칭 (name 우선, cond+day fallback)
+        img_by_name = {img.get("name"): img for img in self.images}
+        gt_pairs = []
+        unmatched = []
+        for t in self._pred_targets:
+            nm = t.get("name", "") or ""
+            match = img_by_name.get(nm)
+            if match is None:
+                cnd = (t.get("cond_hint") or "").strip()
+                day_hint = str(t.get("day") or "").strip()
+                if cnd and day_hint:
+                    for img in self.images:
+                        if (img.get("cond") == cnd
+                                and str(img.get("day", "")) == day_hint):
+                            match = img
+                            break
+            if match is None:
+                unmatched.append(nm or "(unnamed)")
                 continue
             try:
-                day = float(img.get("day"))
+                day = float(match.get("day"))
             except (ValueError, TypeError):
+                unmatched.append(nm)
                 continue
-            gt_imgs.append((img, day))
+            gt_pairs.append((t, day, match))
 
-        if len(gt_imgs) < 5:
+        if len(gt_pairs) < 5:
             messagebox.showwarning(
-                _L("Ground truth 부족", "Insufficient ground truth"),
-                _L(f"라만 매칭된 이미지가 {len(gt_imgs)}장 입니다.\n"
-                   f"최소 5장 필요. 라만 데이터를 추가하거나 매칭을 갱신하세요.",
-                   f"Only {len(gt_imgs)} raman-linked images found.\n"
-                   f"Need at least 5. Add Raman data or update links."))
+                _L("매칭 부족", "Insufficient matches"),
+                _L(f"평가대상 {len(self._pred_targets)}개 중 분석대상과 "
+                   f"매칭된 것은 {len(gt_pairs)}개. 최소 5개 필요.\n\n"
+                   f"같은 DB (예: pkw_1.db) 를 [📂 LOAD ALL] 으로 분석대상에, "
+                   f"같은 이미지들을 평가대상 탭에 ➕ 추가하면 자동 매칭됩니다.\n\n"
+                   f"매칭 실패: {len(unmatched)}개\n"
+                   + "\n".join(unmatched[:5]),
+                   f"Only {len(gt_pairs)} of {len(self._pred_targets)} "
+                   f"targets matched. Need ≥5.\n\n"
+                   f"LOAD the same DB into both analyzed and evaluation."))
             return
 
         all_imgs = [img for img in self.images
                     if img.get("rgb") is not None
                     and img.get("mask") is not None]
 
-        # 진행 상태 — 콘솔 + status bar
-        n = len(gt_imgs)
+        n = len(gt_pairs)
         self._set_status(
-            _L(f"🎯 가중치 최적화: {n}장 leave-one-out 평가 중...",
-               f"🎯 Optimizing: {n} LOO evaluations..."))
+            _L(f"🎯 가중치 최적화: {n} 평가대상 LOO 평가 중...",
+               f"🎯 Optimizing: {n} target LOO evaluations..."))
         self.update_idletasks()
 
         estimates = []
         skipped = []
         import time
         t0 = time.time()
-        for i, (q, true_day) in enumerate(gt_imgs):
+        for i, (t, true_day, matched) in enumerate(gt_pairs):
             try:
-                pool = [im for im in all_imgs if im is not q]
-                if not pool:
-                    skipped.append(q.get("name", "?"))
+                rgb = t.get("rgb")
+                roi = t.get("roi")
+                if rgb is None or roi is None:
+                    skipped.append(t.get("name", "?"))
                     continue
-                m_results = self._adv_compute_for_query(q, pool)
+                mask = roi_to_mask(rgb.shape, roi)
+                lab  = compute_lab_metrics(rgb, mask)
+                q_img = {
+                    "rgb":  rgb,
+                    "mask": mask,
+                    "roi":  roi,
+                    "cond": (t.get("cond_hint")
+                             or matched.get("cond", "")),
+                    "lab":  lab,
+                    "name": t.get("name", ""),
+                    "day":  "",
+                }
+                # 매칭된 분석대상 이미지를 pool 에서 제외 (자기 매칭 회피)
+                pool = [im for im in all_imgs if im is not matched]
+                if not pool:
+                    skipped.append(t.get("name", "?"))
+                    continue
+                m_results = self._adv_compute_for_query(q_img, pool)
                 estimates.append((true_day, m_results))
             except Exception as ex:
-                print(f"[adv-opt] skip {q.get('name','?')}: "
+                print(f"[adv-opt] skip {t.get('name','?')}: "
                       f"{type(ex).__name__}: {ex}")
-                skipped.append(q.get("name", "?"))
+                skipped.append(t.get("name", "?"))
             self._set_status(
                 _L(f"🎯 가중치 최적화: {i+1}/{n} "
                    f"({(time.time()-t0):.1f}s 경과)",
