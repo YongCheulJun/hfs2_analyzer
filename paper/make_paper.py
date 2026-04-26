@@ -1,6 +1,11 @@
 """
-SCIE 논문 .docx 생성 — Elsevier MSSP 형식 모방.
-주저자: Yongcheul Jun, 교신저자: Kwangwook Park.
+SCIE 논문 .docx 생성 — MDPI Applied Sciences 양식 모방.
+주저자: Yongcheul Jun (a), 교신저자: Kwangwook Park (b).
+
+주의: MDPI 공식 양식은 https://www.mdpi.com/journal/applsci/instructions
+에서 .docx 템플릿을 다운로드하는 것이 정석. 본 스크립트는 핵심 양식
+(Palatino Linotype, A4, 단일 칼럼, 윗첨자 소속, * Correspondence,
+숫자 섹션 번호, References numbered list) 만 재현.
 """
 import os
 from docx import Document
@@ -13,20 +18,21 @@ OUT = os.path.join(ROOT, "paper", "Jun_HfS2_image_oxidation.docx")
 
 doc = Document()
 
-# 페이지 여백 — Elsevier 단일 칼럼 스타일
+# 페이지 — MDPI Applied Sciences 기본: A4, 위/아래 1.78cm, 좌/우 1.78cm
 sec = doc.sections[0]
 sec.page_width  = Cm(21.0)
 sec.page_height = Cm(29.7)
-sec.top_margin    = Cm(2.0)
-sec.bottom_margin = Cm(2.0)
-sec.left_margin   = Cm(2.0)
-sec.right_margin  = Cm(2.0)
+sec.top_margin    = Cm(1.78)
+sec.bottom_margin = Cm(1.78)
+sec.left_margin   = Cm(1.78)
+sec.right_margin  = Cm(1.78)
 
-# 기본 스타일
+# 기본 스타일 — MDPI 는 Palatino Linotype 사용 (없으면 Times New Roman 폴백)
 style = doc.styles["Normal"]
-style.font.name = "Times New Roman"
+style.font.name = "Palatino Linotype"
 style.font.size = Pt(10)
 style.paragraph_format.space_after = Pt(2)
+BODY_FONT = "Palatino Linotype"
 
 
 def H(text, level=1, size=12, bold=True, after=4):
@@ -34,7 +40,7 @@ def H(text, level=1, size=12, bold=True, after=4):
     p.paragraph_format.space_before = Pt(8 if level == 1 else 4)
     p.paragraph_format.space_after  = Pt(after)
     r = p.add_run(text)
-    r.font.name = "Times New Roman"
+    r.font.name = BODY_FONT
     r.font.size = Pt(size)
     r.font.bold = bold
     return p
@@ -48,7 +54,7 @@ def P(text, size=10, italic=False, align=None, after=2):
         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     p.paragraph_format.space_after = Pt(after)
     r = p.add_run(text)
-    r.font.name = "Times New Roman"
+    r.font.name = BODY_FONT
     r.font.size = Pt(size)
     r.font.italic = italic
     return p
@@ -63,83 +69,126 @@ def IMG(fname, width_in=6.5, caption=None):
         cp.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         cp.paragraph_format.space_after = Pt(8)
         r = cp.add_run(caption)
-        r.font.name = "Times New Roman"
+        r.font.name = BODY_FONT
         r.font.size = Pt(9)
         r.font.italic = True
 
 
-# ─────────────────── TITLE ───────────────────
+# ─────────────────── TITLE (MDPI Applied Sciences 양식) ───────────────────
+# Article type tag (MDPI 상단 라벨)
+tag = doc.add_paragraph()
+tag.alignment = WD_ALIGN_PARAGRAPH.LEFT
+r = tag.add_run("Article")
+r.font.name = BODY_FONT; r.font.size = Pt(10); r.font.italic = True
+tag.paragraph_format.space_after = Pt(4)
+
 title = doc.add_paragraph()
-title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+title.alignment = WD_ALIGN_PARAGRAPH.LEFT
 r = title.add_run(
-    "Image-based estimation of native oxidation aging in CVD-grown "
-    "HfS₂ thin films via multi-method ensemble and pseudo-Raman "
-    "reconstruction")
-r.font.name = "Times New Roman"
-r.font.size = Pt(14)
+    "Image-based Estimation of Native Oxidation Aging in CVD-grown "
+    "HfS₂ Thin Films via Multi-method Ensemble and Pseudo-Raman "
+    "Reconstruction")
+r.font.name = BODY_FONT
+r.font.size = Pt(16)
 r.font.bold = True
 title.paragraph_format.space_after = Pt(6)
 
-# Authors
+# Authors — MDPI: 저자 이름 + 윗첨자 (Inline superscript via run.font.superscript)
 auth = doc.add_paragraph()
-auth.alignment = WD_ALIGN_PARAGRAPH.CENTER
-r = auth.add_run("Yongcheul Jun")
-r.font.name = "Times New Roman"; r.font.size = Pt(11); r.font.bold = True
-r1 = auth.add_run("ᵃ, ")
-r1.font.size = Pt(9); r1.font.bold = False
-r = auth.add_run("Kwangwook Park")
-r.font.name = "Times New Roman"; r.font.size = Pt(11); r.font.bold = True
-r1 = auth.add_run("ᵃ,*")
-r1.font.size = Pt(9); r1.font.bold = False
+auth.alignment = WD_ALIGN_PARAGRAPH.LEFT
+auth.paragraph_format.space_after = Pt(2)
 
-aff = doc.add_paragraph()
-aff.alignment = WD_ALIGN_PARAGRAPH.CENTER
-r = aff.add_run(
-    "ᵃDivision of Electronics and Information Engineering, "
-    "Jeonbuk National University, Jeonju 54896, Republic of Korea")
-r.font.name = "Times New Roman"; r.font.size = Pt(9); r.font.italic = True
+
+def add_author(par, name, sups, last=False):
+    r = par.add_run(name)
+    r.font.name = BODY_FONT; r.font.size = Pt(11); r.font.bold = False
+    rs = par.add_run(" " + sups)
+    rs.font.name = BODY_FONT; rs.font.size = Pt(11)
+    rs.font.superscript = True
+    if not last:
+        rsep = par.add_run(", ")
+        rsep.font.name = BODY_FONT; rsep.font.size = Pt(11)
+
+
+add_author(auth, "Yongcheul Jun", "1")
+add_author(auth, "Kwangwook Park", "2,*", last=True)
+
+# Affiliations
+def add_aff(num, text):
+    p = doc.add_paragraph()
+    p.paragraph_format.left_indent = Cm(0.5)
+    p.paragraph_format.first_line_indent = Cm(-0.5)
+    p.paragraph_format.space_after = Pt(2)
+    rn = p.add_run(num)
+    rn.font.name = BODY_FONT; rn.font.size = Pt(9)
+    rn.font.superscript = True
+    rt = p.add_run(" " + text)
+    rt.font.name = BODY_FONT; rt.font.size = Pt(9); rt.font.italic = True
+
+
+add_aff("1",
+        "College of Engineering (Major in Intellectual Property "
+        "Convergence), Pusan National University, Busan, 46241, "
+        "Republic of Korea")
+add_aff("2",
+        "Division of Electronics and Information Engineering, "
+        "Jeonbuk National University, Jeonju 54896, "
+        "Republic of Korea")
 
 corr = doc.add_paragraph()
-corr.alignment = WD_ALIGN_PARAGRAPH.CENTER
+corr.paragraph_format.left_indent = Cm(0.5)
+corr.paragraph_format.first_line_indent = Cm(-0.5)
 corr.paragraph_format.space_after = Pt(10)
-r = corr.add_run("*Corresponding author. E-mail: kpark@jbnu.ac.kr "
-                  "(K. Park)")
-r.font.name = "Times New Roman"; r.font.size = Pt(9)
+rs = corr.add_run("*")
+rs.font.name = BODY_FONT; rs.font.size = Pt(9); rs.font.superscript = True
+rt = corr.add_run(" Correspondence: kpark@jbnu.ac.kr (K. P.)")
+rt.font.name = BODY_FONT; rt.font.size = Pt(9)
 
 
-# ─────────────────── ABSTRACT ───────────────────
-H("Abstract", level=1, size=11, bold=True, after=4)
-P("Hafnium disulfide (HfS₂), a layered transition-metal "
-  "dichalcogenide considered for high-mobility electronics and "
-  "photodetectors, undergoes rapid native oxidation under ambient "
-  "humidity, transforming the originally yellow chalcogenide into "
-  "a transparent oxide (HfOₓ) within days. Quantifying the extent of "
-  "oxidation conventionally requires Raman spectroscopy, which is "
-  "instrument-bound and slow. In this work we propose an image-only "
-  "framework that estimates the aging day of CVD-grown HfS₂ thin "
-  "films directly from a single specimen photograph and, in addition, "
-  "reconstructs a pseudo-Raman spectrum without any spectroscopic "
-  "measurement. A pool of 53 specimen images covering four passivation "
-  "conditions (Native HfS₂ at 35% and 70% RH, Al₂O₃- and "
-  "PMMA-encapsulated HfS₂ at 70% RH) and aging days from 0 to 30 d "
-  "is analyzed by five independent estimators — weighted-Euclidean "
-  "k-nearest-neighbour on color metrics, Wasserstein distance on b∗ "
-  "histograms, FFT texture distance, spatial-pattern distance, and an "
-  "exponential-decay kinetic fit — whose outputs are combined by a "
-  "Huber-loss optimised, condition-specific ensemble. Leave-one-out "
-  "evaluation on 33 query specimens yields a weighted-mean root-mean-"
-  "square error of 4.80 d, a 38% reduction relative to the uniform-"
-  "weight baseline (7.74 d). For Al₂O₃-encapsulated HfS₂ the "
-  "image-derived A₁ₒ peak intensity reproduces the measured "
-  "Raman trend (1.00 → 0.60) within the predicted 95% confidence "
-  "interval, demonstrating that image-only pseudo-Raman reconstruction "
-  "can serve as a rapid, non-destructive surrogate for benchtop Raman "
-  "spectroscopy in routine quality screening of HfS₂ thin films.",
-  align="justify", after=6)
+# ─────────────────── ABSTRACT (MDPI style) ───────────────────
+abs_p = doc.add_paragraph()
+abs_p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+abs_p.paragraph_format.space_after = Pt(4)
+rl = abs_p.add_run("Abstract: ")
+rl.font.name = BODY_FONT; rl.font.size = Pt(10); rl.font.bold = True
+rb = abs_p.add_run(
+    "Hafnium disulfide (HfS₂), a layered transition-metal "
+    "dichalcogenide considered for high-mobility electronics and "
+    "photodetectors, undergoes rapid native oxidation under ambient "
+    "humidity, transforming the originally yellow chalcogenide into "
+    "a transparent oxide (HfOₓ) within days. Quantifying the extent of "
+    "oxidation conventionally requires Raman spectroscopy, which is "
+    "instrument-bound and slow. In this work we propose an image-only "
+    "framework that estimates the aging day of CVD-grown HfS₂ thin "
+    "films directly from a single specimen photograph and, in addition, "
+    "reconstructs a pseudo-Raman spectrum without any spectroscopic "
+    "measurement. A pool of 53 specimen images covering four passivation "
+    "conditions (Native HfS₂ at 35% and 70% RH, Al₂O₃- and "
+    "PMMA-encapsulated HfS₂ at 70% RH) and aging days from 0 to 30 d "
+    "is analyzed by five independent estimators—weighted-Euclidean "
+    "k-nearest-neighbour on color metrics, Wasserstein distance on b∗ "
+    "histograms, FFT texture distance, spatial-pattern distance, and an "
+    "exponential-decay kinetic fit—whose outputs are combined by a "
+    "Huber-loss optimised, condition-specific ensemble. Leave-one-out "
+    "evaluation on 33 query specimens yields a weighted-mean root-mean-"
+    "square error of 4.80 d, a 38% reduction relative to the uniform-"
+    "weight baseline (7.74 d). For Al₂O₃-encapsulated HfS₂ the "
+    "image-derived A₁ₒ peak intensity reproduces the measured "
+    "Raman trend (1.00 → 0.60) within the predicted 95% confidence "
+    "interval, demonstrating that image-only pseudo-Raman reconstruction "
+    "can serve as a rapid, non-destructive surrogate for benchtop Raman "
+    "spectroscopy in routine quality screening of HfS₂ thin films.")
+rb.font.name = BODY_FONT; rb.font.size = Pt(10)
 
-P("Keywords: Hafnium disulfide; Native oxidation; Image processing; "
-  "Pseudo-Raman; Ensemble regression; CVD thin films",
-  size=9, italic=False, after=10)
+kw_p = doc.add_paragraph()
+kw_p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+kw_p.paragraph_format.space_after = Pt(10)
+rl = kw_p.add_run("Keywords: ")
+rl.font.name = BODY_FONT; rl.font.size = Pt(10); rl.font.bold = True
+rb = kw_p.add_run(
+    "hafnium disulfide; native oxidation; image processing; "
+    "pseudo-Raman; ensemble regression; CVD thin films")
+rb.font.name = BODY_FONT; rb.font.size = Pt(10)
 
 # ─────────────────── 1. INTRODUCTION ───────────────────
 H("1. Introduction", level=1, size=12, bold=True)
