@@ -9219,6 +9219,19 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
 
         tk.Frame(res_f, bg=BORDER, height=1).pack(fill="x", padx=8, pady=6)
 
+        # Stage similarity 차트
+        tk.Label(res_f, text=_L("  📊 Stage Similarity (cond 기준)",
+                                "  📊 Stage Similarity (per cond)"),
+                 bg=PANEL, fg=SUB, font=LF).pack(anchor="w", padx=8)
+        self._adv_stage_frame = tk.Frame(res_f, bg=CARD, height=140,
+                                          highlightbackground=BORDER,
+                                          highlightthickness=1)
+        self._adv_stage_frame.pack(fill="x", padx=8, pady=(2, 4))
+        self._adv_stage_frame.pack_propagate(False)
+        self._adv_stage_canvas = None
+
+        tk.Frame(res_f, bg=BORDER, height=1).pack(fill="x", padx=8, pady=6)
+
         # 해석 텍스트
         tk.Label(res_f, text="  Interpretation",
                  bg=PANEL, fg=SUB, font=LF).pack(anchor="w", padx=8)
@@ -9655,6 +9668,76 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             return
         self._adv_show_for_target(t)
 
+    def _adv_draw_stage_chart(self, t: dict):
+        """선택된 평가대상의 stage similarity 차트 (3 막대 + best 강조).
+
+        x축 = early/mid/late, y축 = 정규화 거리 (낮을수록 가까움).
+        best_stage 는 색 강조 + ★ 마커.
+        """
+        # 기존 캔버스 제거
+        old = self._adv_stage_canvas
+        if old is not None:
+            try: old.get_tk_widget().destroy()
+            except Exception: pass
+            self._adv_stage_canvas = None
+
+        res = t.get("result") or {}
+        stage = res.get("stage")
+        if not stage or not stage.get("distances"):
+            tk.Label(self._adv_stage_frame,
+                     text=_L("(stage 데이터 없음)",
+                             "(no stage data)"),
+                     bg=CARD, fg=SUB, font=LF).pack(expand=True)
+            return
+
+        dists = stage["distances"]
+        best  = stage.get("best_stage")
+        sigs  = stage.get("stage_sigs", {})
+        labels_kr = {"early": "초기", "mid": "중기", "late": "말기"}
+        order = [s for s in ("early", "mid", "late") if s in dists]
+        if not order:
+            return
+        ys = [dists[s] for s in order]
+        xs_lbl = [f"{labels_kr.get(s, s)}\n"
+                  f"d{sigs.get(s, {}).get('day_range', ('?','?'))[0]}-"
+                  f"{sigs.get(s, {}).get('day_range', ('?','?'))[1]}"
+                  for s in order]
+        colors = ["#9ca3af"] * len(order)
+        if best in order:
+            colors[order.index(best)] = "#22c55e"
+
+        fig = plt.Figure(figsize=(3.4, 1.4), dpi=96, facecolor=PANEL)
+        ax = fig.add_subplot(111)
+        styled_ax(ax)
+        bars = ax.bar(range(len(order)), ys, color=colors,
+                      edgecolor="white", linewidth=0.6)
+        ax.set_xticks(range(len(order)))
+        ax.set_xticklabels(xs_lbl, fontsize=6)
+        ax.tick_params(axis="y", labelsize=6)
+        ax.set_ylabel(_L("거리(낮을수록 가까움)",
+                         "Distance (lower = closer)"),
+                      fontsize=6, color=SUB)
+        # best 위에 ★
+        if best in order:
+            i = order.index(best)
+            ax.text(i, ys[i], "★", ha="center", va="bottom",
+                    fontsize=11, color="#16a34a", fontweight="bold")
+        for i, b in enumerate(bars):
+            ax.text(b.get_x() + b.get_width()/2, b.get_height(),
+                    f"{ys[i]:.2f}", ha="center", va="bottom",
+                    fontsize=6, color=SUB)
+        # Al2O3 등 low_time_res 면 차트 제목에 경고
+        title = _L("Stage Similarity", "Stage Similarity")
+        if res.get("low_time_res"):
+            title += _L("  ⚠ 정확도 한계", "  ⚠ limited")
+        ax.set_title(title, fontsize=7, color=TXT)
+        fig.tight_layout(pad=0.3)
+
+        cv = FigureCanvasTkAgg(fig, master=self._adv_stage_frame)
+        cv.get_tk_widget().pack(fill="both", expand=True)
+        self._adv_stage_canvas = cv
+        cv.draw()
+
     def _adv_show_for_target(self, t: dict):
         """선택된 평가대상의 5 methods + ensemble + 가중치 + 해석 표시."""
         res = t.get("result") or {}
@@ -9777,6 +9860,10 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             try: self._adv_draw_radial()
             except Exception as ex:
                 print(f"[adv-chart rad] {type(ex).__name__}: {ex}")
+        # Stage similarity bar chart (target 별)
+        try: self._adv_draw_stage_chart(t)
+        except Exception as ex:
+            print(f"[adv-chart stage] {type(ex).__name__}: {ex}")
 
     def _adv_run_inner(self, target: dict, pool: list, ctx: dict):
         """실제 연산 — 5가지 방법 + 앙상블"""
