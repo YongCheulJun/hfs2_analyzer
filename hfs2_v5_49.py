@@ -7375,6 +7375,29 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             "ens_day":  ens["est_day"],
             "ens_conf": ens["confidence"],
             "weights":  ens["weights"],
+            # 차트 갱신용 데이터 (Advanced 탭 Tree 선택 시 self._last_adv_ctx
+            # 로 swap 되어 _adv_draw_hist/fft/radial 가 사용)
+            "_chart": {
+                "target":         target,
+                "pool":           pool,
+                "t_hist":         t_hist,
+                "t_fft":          t_fft,
+                "t_spatial":      t_spatial,
+                "kinetic_params": kp,
+                "wass_day":       w_res["est_day"],
+                "wass_scores":    w_res.get("scores", []),
+                "fft_day":        f_res["est_day"],
+                "fft_scores":     f_res.get("scores", []),
+                "spatial_day":    s_res["est_day"],
+                "spatial_scores": s_res.get("scores", []),
+                "kinetic_day":    k_res["est_day"],
+                "kinetic_detail": k_res,
+                "ens_day":        ens["est_day"],
+                "ens_conf":       ens["confidence"],
+                "weights":        ens["weights"],
+                "knn_day":        knn_day,
+                "knn_conf":       knn_conf,
+            },
         }
 
     def _pred_run_all(self):
@@ -9403,6 +9426,20 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                         for n in ("knn","wass","fft","spatial","kinetic"))
         )
         self._adv_set_interp(interp)
+
+        # 차트 갱신 — _last_adv_ctx swap 후 기존 draw 함수 호출
+        chart = adv.get("_chart")
+        if chart:
+            self._last_adv_ctx = chart
+            try: self._adv_draw_hist()
+            except Exception as ex:
+                print(f"[adv-chart hist] {type(ex).__name__}: {ex}")
+            try: self._adv_draw_fft()
+            except Exception as ex:
+                print(f"[adv-chart fft] {type(ex).__name__}: {ex}")
+            try: self._adv_draw_radial()
+            except Exception as ex:
+                print(f"[adv-chart rad] {type(ex).__name__}: {ex}")
 
     def _adv_run_inner(self, target: dict, pool: list, ctx: dict):
         """실제 연산 — 5가지 방법 + 앙상블"""
