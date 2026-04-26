@@ -1608,16 +1608,36 @@ def db_save_all(path: str, images: list) -> int:
     return count
 
 
+def _db_open_read(path: str, timeout: float = 15.0) -> sqlite3.Connection:
+    """읽기 전용으로 열기 — ALTER/CREATE/PRAGMA 변경 안 함.
+
+    LOAD 경로에서 사용: 9p 마운트의 SQLite 파일 lock 회피. mode=ro 는
+    journal/wal 변경을 시도하지 않으므로 동시 실행 중인 외부 도구
+    (DB Browser 등) 와도 충돌 없음.
+    """
+    uri = f"file:{path}?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=timeout)
+    con.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+    return con
+
+
 def db_load_all(path: str) -> list:
-    """DB에서 전체 이미지 레코드를 dict 리스트로 반환 (rgb_blob + raman_id 포함)"""
-    con = db_init(path)
-    rows = con.execute("""
+    """DB에서 전체 이미지 레코드를 dict 리스트로 반환 (rgb_blob + raman_id 포함).
+
+    read-only 로 열어 9p 마운트의 SQLite lock 회피.
+    raman_id 컬럼이 구 DB 에 없으면 None 으로 fallback (ALTER 안 함).
+    """
+    con = _db_open_read(path)
+    cols = [r[1] for r in con.execute("PRAGMA table_info(images)").fetchall()]
+    has_raman_col = "raman_id" in cols
+    select_raman = "raman_id" if has_raman_col else "NULL AS raman_id"
+    rows = con.execute(f"""
         SELECT name, day, cond,
                roi_x0, roi_y0, roi_x1, roi_y1,
                s_mean, yellow_ratio, yellowness_idx,
                lab_L, lab_a, lab_b, delta_e,
                glcm_con, glcm_eng, glcm_hom, glcm_cor,
-               stats_json, rgb_blob, thumb_blob, raman_id, saved_at
+               stats_json, rgb_blob, thumb_blob, {select_raman}, saved_at
         FROM images ORDER BY cond, CAST(day AS REAL)
     """).fetchall()
     con.close()
@@ -1665,10 +1685,13 @@ def db_load_all(path: str) -> list:
 
 
 def db_load_raman_all(path: str) -> list:
-    """통합 DB 에서 raman_data 전체 로드 (id 보존). 빈 테이블이면 [] 반환."""
+    """통합 DB 에서 raman_data 전체 로드 (id 보존). 빈 테이블이면 [] 반환.
+
+    read-only 모드로 열어 9p lock 회피.
+    """
     out = []
     try:
-        con = _db_open_safe(path)
+        con = _db_open_read(path)
         try:
             cur = con.execute(
                 "SELECT name FROM sqlite_master "
@@ -5084,7 +5107,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         for path in paths:
             fname = os.path.basename(path).lower()
             try:
-                con = _db_open_safe(path)
+                # read-only 로 테이블 조회 — 9p 마운트 lock 회피
+                con = _db_open_read(path)
                 tables = {r[0] for r in
                           con.execute("SELECT name FROM sqlite_master"
                                       " WHERE type='table'").fetchall()}
@@ -5679,10 +5703,13 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 "No Raman data found in the selected file.\n"
                 "Save Raman data first using [Save Raman DB].")
     def _db_load_raman(self, path: str) -> int:
-        """Raman 데이터 로드 (내부 공용). 추가된 항목 수 반환."""
+        """Raman 데이터 로드 (내부 공용). 추가된 항목 수 반환.
+
+        read-only 모드 — 9p 마운트 lock 회피.
+        """
         try:
             import sqlite3 as _sq, json as _js
-            con = _db_open_safe(path)
+            con = _db_open_read(path)
             rows = con.execute(
                 "SELECT cond,day,peak,norm_peak,peak_shift,"
                 "peak_range,spectrum_json FROM raman_data"
@@ -14229,7 +14256,12 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
     # ─────────────────────────────────────────
     #  이미지 추가
     # ─────────────────────────────────────────
-    def _add_image(self, pil_img, name):
+    def _add_image(self, pil_img, name, defer_rebuild=False):
+        """이미지 1장을 self.images 에 추가.
+
+        defer_rebuild=True 이면 _rebuild_list / 상태바 갱신을 호출자가 마지막에
+        한 번만 하도록 위임 — N장 일괄 추가 시 O(N²) → O(N).
+        """
         pil_rgb = pil_img.convert("RGB")
         rgb = np.array(pil_rgb)
         H_ch,S_ch,I_ch = rgb_to_hsi(rgb)
@@ -14258,6 +14290,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         entry["thumb"] = make_thumb(rgb, self.TW, self.TH, auto_roi)
         self.images.append(entry)
         if len(self.images)==1: self.sel_idx=0
+        if defer_rebuild:
+            return
         self._rebuild_list()
         sym, ko, en = _ROI_FLAG_LABEL.get(roi_flag, ("•", roi_flag, roi_flag))
         self._set_status(
@@ -14265,14 +14299,94 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             + (f"  →  day={auto_day}, cond={auto_cond}" if auto_parsed else "")
             + _L(f"  | 자동 ROI {sym} {ko}", f"  | Auto ROI {sym} {en}"))
 
+    def _add_images_bulk(self, items):
+        """이미지 여러 장 일괄 추가. items = [(pil_img, name), ...].
+
+        무거운 작업(PIL decode, rgb_to_hsi, auto_detect_roi, make_thumb)을
+        ThreadPoolExecutor 로 병렬 처리한 뒤 메인 스레드에서 tk.StringVar
+        를 만들고 dict 를 조립해 self.images 에 append. 마지막에 _rebuild_list
+        를 단 한 번만 호출.
+
+        반환: 추가 성공한 이미지 수, 실패 메시지 리스트.
+        """
+        if not items:
+            return 0, []
+        from concurrent.futures import ThreadPoolExecutor
+
+        TW, TH = self.TW, self.TH
+
+        def _prep(pil_img, name):
+            try:
+                pil_rgb = pil_img.convert("RGB")
+                rgb = np.array(pil_rgb)
+                hsi = rgb_to_hsi(rgb)
+                day, cond = parse_filename_tags(name)
+                roi, flag, reason = auto_detect_roi(rgb, cond=cond)
+                thumb = make_thumb(rgb, TW, TH, roi)
+                mask = roi_to_mask(rgb.shape, roi)
+                return ("ok", name, rgb, hsi, day, cond,
+                        roi, flag, reason, thumb, mask)
+            except Exception as ex:
+                return ("err", name, str(ex))
+
+        max_workers = max(2, min(8, (os.cpu_count() or 4)))
+        results = []
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for r in ex.map(lambda it: _prep(*it), items):
+                results.append(r)
+
+        errors = []
+        added = 0
+        for r in results:
+            if r[0] != "ok":
+                errors.append(f"{r[1]}: {r[2]}")
+                continue
+            (_, name, rgb, hsi, day, cond,
+             roi, flag, reason, thumb, mask) = r
+            entry = {
+                "name": name, "rgb": rgb, "hsi": hsi,
+                "mask": mask, "roi": roi,
+                "roi_flag": flag, "roi_reason": reason,
+                "stats": {}, "thumb": thumb,
+                "day_var":  tk.StringVar(value=day),
+                "cond_var": tk.StringVar(value=cond),
+                "day": day, "cond": cond,
+                "auto_parsed": bool(day or cond),
+                "s_mean": np.nan, "yellow_ratio": np.nan,
+                "yellowness_idx": np.nan,
+                "lab": {"L": np.nan, "a": np.nan, "b": np.nan},
+                "glcm": {"contrast": np.nan, "energy": np.nan,
+                         "homogeneity": np.nan, "correlation": np.nan},
+                "delta_e": np.nan,
+            }
+            self.images.append(entry)
+            added += 1
+
+        if added > 0 and self.sel_idx < 0:
+            self.sel_idx = 0
+        if added > 0:
+            self._rebuild_list()
+        return added, errors
+
     def _load(self):
         paths=filedialog.askopenfilenames(
             title=_L("이미지 선택","Select Images"),
             filetypes=[(_L("이미지","Image"),"*.png *.jpg *.jpeg *.bmp *.tiff"),
                        (_L("전체","All"),"*.*")])
+        if not paths: return
+        items = []
         for p in paths:
-            try: self._add_image(Image.open(p), os.path.basename(p))
-            except Exception as ex: messagebox.showerror(_L("오류","Error"),str(ex))
+            try:
+                items.append((Image.open(p), os.path.basename(p)))
+            except Exception as ex:
+                messagebox.showerror(_L("오류","Error"), f"{p}\n{ex}")
+        added, errors = self._add_images_bulk(items)
+        if errors:
+            messagebox.showwarning(
+                _L("일부 실패","Partial failure"),
+                "\n".join(errors[:8]))
+        self._set_status(
+            _L(f"✓ {added}개 추가", f"✓ {added} added"))
 
     def _paste(self):
         pil=None
@@ -14333,11 +14447,19 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 return
         except Exception:
             pass
+        items = []
         for p in imgs:
-            try: self._add_image(Image.open(p), os.path.basename(p))
+            try:
+                items.append((Image.open(p), os.path.basename(p)))
             except Exception as ex:
-                messagebox.showerror(_L("오류","Error"),f"{p}\n{ex}")
-        self._set_status(_L(f"✓ {len(imgs)}개 추가 — ROI를 선택한다", f"✓ {len(imgs)} added — set ROI"))
+                messagebox.showerror(_L("오류","Error"), f"{p}\n{ex}")
+        added, errors = self._add_images_bulk(items)
+        if errors:
+            messagebox.showwarning(
+                _L("일부 실패","Partial failure"),
+                "\n".join(errors[:8]))
+        self._set_status(_L(f"✓ {added}개 추가 — ROI를 선택한다",
+                            f"✓ {added} added — set ROI"))
 
     # ─────────────────────────────────────────
     #  선택/동기화/유틸
