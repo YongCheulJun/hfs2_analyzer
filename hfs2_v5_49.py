@@ -2625,15 +2625,15 @@ class App(_Base):
                  font=("Segoe UI",12,"bold")).pack(side="left", padx=16, pady=10)
 
         for txt,cmd,acc in [
-            ("📂 Add",         self._load,             False),
-            ("📋 Paste",       self._paste,            False),
-            ("▶ Analyze All",  self._run_all,          True),
-            ("🗄 DB Save",     self._db_save,          False),
-            ("📂 DB Load",     self._db_load,          False),
-            ("📦 Load All",    self._load_all_db,      False),
-            ("💾 CSV",          self._export_csv,       False),
-            ("📄 Report",      self._generate_report,  False),
-            ("🗑 Clear",       self._clear,            False),
+            ("📂 Add",                self._load,             False),
+            ("📋 Paste",              self._paste,            False),
+            ("▶ Analyze All",         self._run_all,          True),
+            ("💾 Save All",           self._db_save,          True),
+            ("📦 Load All",           self._load_all_db,      True),
+            ("📂 DB Load (1 file)",   self._db_load,          False),
+            ("💾 CSV",                self._export_csv,       False),
+            ("📄 Report",             self._generate_report,  False),
+            ("🗑 Clear",              self._clear,            False),
         ]:
             tk.Button(tb, text=txt, command=cmd,
                       bg=ACCENT if acc else BTN,
@@ -5880,22 +5880,45 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         if loaded_target and hasattr(self, "_pred_draw_preview"):
             self.after(200, self._pred_draw_preview)
 
-        # 결과 요약
-        parts = []
-        if n_img    > 0: parts.append(f"{n_img} image records")
-        if n_raman  > 0: parts.append(f"{n_raman} Raman entries")
-        if loaded_target:  parts.append("evaluation target")
-        if not parts:
-            summary = "Nothing new loaded (all duplicates or empty files)."
-        else:
-            summary = "Loaded: " + ",  ".join(parts)
-
+        # 결과 요약 (이미지 + 라만 + 평가대상 + raman_id 매칭 모두)
+        n_links = sum(1 for img in self.images
+                      if img.get("raman_id") is not None)
+        n_targets_now = (len(self._pred_targets)
+                         if hasattr(self, "_pred_targets") else 0)
+        msg_lines = ["📦 Load All — done"]
+        msg_lines.append(
+            f"  📷 이미지: {n_img} {_L('새로 추가', 'new added')}"
+            f"  ({_L('총', 'total')} {len(self.images)})")
+        msg_lines.append(
+            f"  📡 라만: {n_raman} {_L('새로 추가', 'new added')}"
+            f"  ({_L('총', 'total')} "
+            f"{len(getattr(self, '_raman_data', []))})")
+        if loaded_target:
+            msg_lines.append(
+                f"  🎯 {_L('평가대상 복원됨', 'eval targets restored')}"
+                f"  ({_L('총', 'total')} {n_targets_now})")
+        if n_links > 0:
+            msg_lines.append(
+                f"  ⚛ {_L('이미지↔라만 매칭', 'image↔raman links')}: "
+                f"{n_links}")
+        if n_img == 0 and n_raman == 0 and not loaded_target:
+            msg_lines.append(
+                _L("(중복이거나 빈 파일 — 새로 추가된 데이터 없음)",
+                   "(all duplicates or empty — nothing new)"))
         if errors:
-            summary += f"\n\nWarnings ({len(errors)}):\n" + "\n".join(errors[:5])
+            msg_lines.append("")
+            msg_lines.append(
+                _L(f"⚠ 경고 {len(errors)}건:",
+                   f"⚠ Warnings ({len(errors)}):"))
+            for e in errors[:5]:
+                msg_lines.append(f"  {e}")
 
-        msg_title = "Load All — Done"
-        messagebox.showinfo(msg_title, summary)
-        self._set_status("📂 " + summary.split("\n")[0])
+        summary = "\n".join(msg_lines)
+        messagebox.showinfo("Load All — Done", summary)
+        self._set_status(
+            f"📦 Load All — img+{n_img} raman+{n_raman} "
+            f"links={n_links}"
+            + (f" target+1" if loaded_target else ""))
 
     def _db_save(self):
         if not self.images:
@@ -6032,10 +6055,36 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             unanalyzed = max(0, n - analyzed_n)
             ana_note = (f"  ({analyzed_n} analyzed, {unanalyzed} ROI-only)"
                         if unanalyzed > 0 else "")
-            messagebox.showinfo(_L("저장 완료", "Saved"),
-                f"Saved {n} images{ana_note}{eval_note} to DB.\n{path}")
+            n_raman_saved = (len(self._raman_data)
+                             if hasattr(self, "_raman_data") else 0)
+            n_links = sum(1 for img in self.images
+                          if img.get("raman_id") is not None)
+            msg_lines = [
+                _L("💾 Save All — 통합 저장 완료",
+                   "💾 Save All — done"),
+                f"  📷 {_L('이미지', 'images')}: {n}{ana_note}",
+            ]
+            if eval_note:
+                msg_lines.append(
+                    f"  🎯 {_L('평가대상', 'eval targets')}:"
+                    f"{eval_note.lstrip(' +')}")
+            if n_raman_saved > 0:
+                msg_lines.append(
+                    f"  📡 {_L('라만', 'raman')}: "
+                    f"{n_raman_saved} entries")
+            if n_links > 0:
+                msg_lines.append(
+                    f"  ⚛ {_L('이미지↔라만 매칭', 'image↔raman links')}: "
+                    f"{n_links}")
+            msg_lines.append("")
+            msg_lines.append(path)
+            messagebox.showinfo(
+                _L("저장 완료", "Save All complete"),
+                "\n".join(msg_lines))
             self._set_status(
-                f"🗄 DB saved — {n} records{ana_note}  ({os.path.basename(path)})")
+                f"💾 Save All — img={n}{ana_note} "
+                f"raman={n_raman_saved} links={n_links}  "
+                f"({os.path.basename(path)})")
         except Exception as ex:
             tmp_size_now = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else -1
             dst_size_now = os.path.getsize(path) if os.path.exists(path) else -1
