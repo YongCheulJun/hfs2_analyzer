@@ -1036,6 +1036,29 @@ def adv_ensemble(knn_day: float | None, knn_conf: float,
     return {"est_day": est_day, "confidence": ens_conf, "weights": weights_full}
 
 
+def _resolve_adv_prior(saved, cond=None):
+    """settings.json 의 adv_weights 값을 단일 cond 의 flat prior 로 변환.
+
+    저장 형식 두 가지 지원:
+      ① flat: {"knn":..., "wass":..., "fft":..., "spatial":..., "kinetic":...}
+        → 모든 cond 에 동일 적용
+      ② nested: {"_default": {...}, "<cond>": {...}, "<cond2>": {...}}
+        → cond 매칭 시 그 dict 우선, 없으면 "_default", 그것도 없으면 None
+    """
+    if not isinstance(saved, dict) or not saved:
+        return None
+    methods = ("knn", "wass", "fft", "spatial", "kinetic")
+    # flat 형식 — 키들이 method 이름
+    if any(k in saved for k in methods):
+        return saved
+    # nested 형식 — cond 매칭
+    if cond and cond in saved:
+        return saved[cond]
+    if "_default" in saved:
+        return saved["_default"]
+    return None
+
+
 def optimize_advanced_weights(estimates: list) -> dict:
     """Ground-truth 기반 advanced ensemble weight 최적화.
 
@@ -7363,13 +7386,16 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         except Exception:
             pass
 
+        # cond 별 nested dict 지원 — target.cond 매칭 prior 추출
+        prior = _resolve_adv_prior(saved_w, target.get("cond", ""))
+
         ens = adv_ensemble(
             knn_day, knn_conf,
             w_res["est_day"], w_res["confidence"],
             f_res["est_day"], f_res["confidence"],
             s_res["est_day"], s_res["confidence"],
             k_res["est_day"], k_res["confidence"],
-            prior_weights=saved_w,
+            prior_weights=prior,
         )
 
         return {
@@ -9219,11 +9245,38 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                    f"Only {len(estimates)} estimates — insufficient (≥5)."))
             return
 
+        # 통합 (default) 학습
         opt = optimize_advanced_weights(estimates)
 
-        # settings 저장
+        # cond 별 분리 학습 — 각 cond ≥3 쌍이면 별도 학습
+        from collections import defaultdict
+        by_cond = defaultdict(list)
+        # estimates: [(true_day, m_results)] — cond 정보가 별도 필요. gt_pairs 에서 cond 추출
+        # gt_pairs 는 (t, true_day, matched). cond = matched.get("cond")
+        # 같은 인덱스 매칭이 보장되지 않으므로 다시 정렬
+        # 순서: estimates 와 gt_pairs 의 순서가 다를 수 있음 (skip 처리)
+        # 단순: estimate 수집 시 cond 도 같이 저장하도록 위에서 변경 필요. 여기선 매칭 다시 시도
+        # 우회: gt_pairs 의 (t, true_day, matched) 에서 cond 가져옴
+        cond_estimates = []
+        for (t, true_day, matched), est_pair in zip(gt_pairs, estimates):
+            cond = matched.get("cond", "")
+            cond_estimates.append((cond, est_pair[0], est_pair[1]))
+            by_cond[cond].append(est_pair)
+
+        per_cond_opts = {}
+        for cond, est_list in by_cond.items():
+            if len(est_list) >= 3:
+                per_cond_opts[cond] = optimize_advanced_weights(est_list)
+
+        # settings 저장 — cond 별이 있으면 nested, 없으면 flat
         settings = load_settings()
-        settings["adv_weights"] = opt["weights"]
+        if per_cond_opts:
+            saved_dict = {"_default": opt["weights"]}
+            for c, o in per_cond_opts.items():
+                saved_dict[c] = o["weights"]
+            settings["adv_weights"] = saved_dict
+        else:
+            settings["adv_weights"] = opt["weights"]
         save_settings(settings)
 
         methods = ["knn", "wass", "fft", "spatial", "kinetic"]
@@ -9232,37 +9285,52 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             improve_pct = (opt["baseline_rmse"] - opt["rmse"]) \
                           / opt["baseline_rmse"] * 100
 
+        # cond 별 weight 표 (있으면)
+        per_cond_block = ""
+        if per_cond_opts:
+            lines = ["\ncond 별 가중치 (≥3쌍 학습):"]
+            for c in sorted(per_cond_opts):
+                co = per_cond_opts[c]
+                lines.append(
+                    f"  [{c}]  n={co['n']}  "
+                    f"RMSE {co['rmse']:.2f}d (균등 {co['baseline_rmse']:.2f}d)")
+                lines.append(
+                    "    " + "  ".join(
+                        f"{m}={co['weights'][m]*100:.0f}%"
+                        for m in methods))
+            per_cond_block = "\n".join(lines)
+
         if (lambda: True)():  # 단일 메시지 박스 (KO/EN 토글)
             if hasattr(self, "_lang_var") and self._lang_var.get() == "ko":
                 msg = (
                     f"앙상블 가중치 최적화 완료\n\n"
-                    f"Ground truth (라만 매칭 이미지): "
-                    f"{len(estimates)}장\n"
-                    f"건너뜀: {len(skipped)}장\n\n"
-                    f"균등 weight RMSE: {opt['baseline_rmse']:.2f} 일\n"
-                    f"최적 weight RMSE: {opt['rmse']:.2f} 일\n"
+                    f"평가대상-분석대상 매칭: "
+                    f"{len(estimates)}쌍 (건너뜀 {len(skipped)})\n\n"
+                    f"통합 (default) 균등 RMSE: {opt['baseline_rmse']:.2f} 일\n"
+                    f"통합 (default) 최적 RMSE: {opt['rmse']:.2f} 일\n"
                     f"개선: {improve_pct:.1f}%\n\n"
-                    f"최적 가중치 (settings.json 저장됨):\n"
+                    f"통합 가중치 (settings.json _default):\n"
                     + "\n".join(
                         f"  {m:<8s} {opt['weights'][m]*100:>5.1f}%   "
                         f"(단독 RMSE {opt['per_method_rmse'][m]:.2f}일)"
                         for m in methods)
-                    + "\n\n다음 Advanced 분석부터 적용됩니다.")
+                    + per_cond_block
+                    + "\n\n다음 Advanced 분석부터 cond 별로 자동 적용됩니다.")
             else:
                 msg = (
                     f"Ensemble weight optimization complete\n\n"
-                    f"Ground truth (raman-linked): "
-                    f"{len(estimates)} images\n"
-                    f"Skipped: {len(skipped)}\n\n"
-                    f"Uniform weight RMSE: {opt['baseline_rmse']:.2f} d\n"
-                    f"Optimal weight RMSE: {opt['rmse']:.2f} d\n"
+                    f"Pairs matched: {len(estimates)} "
+                    f"(skipped {len(skipped)})\n\n"
+                    f"Default uniform RMSE: {opt['baseline_rmse']:.2f} d\n"
+                    f"Default optimal RMSE: {opt['rmse']:.2f} d\n"
                     f"Improvement: {improve_pct:.1f}%\n\n"
-                    f"Optimal weights (saved to settings.json):\n"
+                    f"Default weights (settings.json):\n"
                     + "\n".join(
                         f"  {m:<8s} {opt['weights'][m]*100:>5.1f}%   "
                         f"(solo RMSE {opt['per_method_rmse'][m]:.2f}d)"
                         for m in methods)
-                    + "\n\nApplied from next Advanced run.")
+                    + per_cond_block
+                    + "\n\nApplied per-cond from next Advanced run.")
 
         messagebox.showinfo(
             _L("최적화 완료", "Optimization complete"), msg)
@@ -9514,23 +9582,24 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         kinetic_day, kinetic_conf = k_res["est_day"], k_res["confidence"]
 
         # ── 5. 앙상블 ────────────────────────────────────────
-        # settings.json 의 adv_weights 가 있으면 prior 로 적용 — 라만 매칭
-        # 이미지 ground truth 로 학습된 최적 가중치
+        # settings.json 의 adv_weights (flat 또는 cond 별 nested) prior 적용
         try:
             _saved = load_settings().get("adv_weights")
         except Exception:
             _saved = None
+        _prior = _resolve_adv_prior(_saved, target.get("cond", ""))
         ens = adv_ensemble(knn_day,     knn_conf,
                            wass_day,    wass_conf,
                            fft_day,     fft_conf,
                            spatial_day, spatial_conf,
                            kinetic_day, kinetic_conf,
-                           prior_weights=_saved)
+                           prior_weights=_prior)
         ens_day  = ens["est_day"]
         ens_conf = ens["confidence"]
         weights  = ens["weights"]
-        if _saved:
-            print(f"[adv-ensemble] using saved adv_weights: {_saved}")
+        if _prior:
+            print(f"[adv-ensemble] using prior weights "
+                  f"(cond={target.get('cond','')}): {_prior}")
 
         # ── 6. 결과 저장 ─────────────────────────────────────
         self._last_adv_ctx = {

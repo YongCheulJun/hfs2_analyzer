@@ -324,15 +324,42 @@ def main():
         for fn, why in skipped[:10]:
             print(f"  {fn}: {why}")
 
+    # cond 별 분리 학습 (≥3쌍)
+    from collections import defaultdict
+    by_cond_groups = defaultdict(list)
+    for td, mr, fname, cond in estimates:
+        by_cond_groups[cond].append((td, mr))
+
+    per_cond_opts = {}
+    print("\n=== Per-cond Optimization ===")
+    for cond, sub in sorted(by_cond_groups.items()):
+        if len(sub) < 3:
+            print(f"  {cond:<22} n={len(sub)} <3 — skip")
+            continue
+        co = optimize_advanced_weights(sub)
+        per_cond_opts[cond] = co
+        improve_c = ((co['baseline_rmse'] - co['rmse']) /
+                     max(co['baseline_rmse'], 1e-6) * 100)
+        print(f"  {cond:<22} n={len(sub):>2}  "
+              f"RMSE {co['rmse']:>5.2f}d (uniform {co['baseline_rmse']:>5.2f}d, "
+              f"+{improve_c:.1f}%)")
+        print(f"    weights: " +
+              "  ".join(f"{m}={co['weights'][m]*100:.0f}%" for m in methods))
+
     if args.save:
         from hfs2_v5_49 import load_settings, save_settings, _settings_path
         settings = load_settings()
-        settings["adv_weights"] = opt["weights"]
-        ok = save_settings(settings)
-        if ok:
-            print(f"\n[save] adv_weights → {_settings_path()}")
+        if per_cond_opts:
+            saved_dict = {"_default": opt["weights"]}
+            for c, co in per_cond_opts.items():
+                saved_dict[c] = co["weights"]
+            settings["adv_weights"] = saved_dict
+            print(f"\n[save] adv_weights (nested: _default + "
+                  f"{len(per_cond_opts)} cond) → {_settings_path()}")
         else:
-            print("\n[save] FAILED — settings.json write error")
+            settings["adv_weights"] = opt["weights"]
+            print(f"\n[save] adv_weights (flat) → {_settings_path()}")
+        save_settings(settings)
 
 
 if __name__ == "__main__":
