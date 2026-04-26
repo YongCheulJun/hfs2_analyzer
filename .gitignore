@@ -35,6 +35,12 @@ newfiles/
 dbfiles/
 pkw_papers/
 
+# paper 폴더는 예외 — figure(png), .docx, .py 모두 추적
+!paper/
+!paper/**
+!paper/figures/
+!paper/figures/**
+
 # IDE
 .vscode/
 .idea/
