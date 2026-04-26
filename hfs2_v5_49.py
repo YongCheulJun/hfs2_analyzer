@@ -1609,15 +1609,36 @@ def db_save_all(path: str, images: list) -> int:
 
 
 def _db_open_read(path: str, timeout: float = 15.0) -> sqlite3.Connection:
-    """읽기 전용으로 열기 — ALTER/CREATE/PRAGMA 변경 안 함.
+    """읽기 전용 open — ALTER/CREATE/PRAGMA journal 변경 시도 안 함.
 
-    LOAD 경로에서 사용: 9p 마운트의 SQLite 파일 lock 회피. mode=ro 는
-    journal/wal 변경을 시도하지 않으므로 동시 실행 중인 외부 도구
-    (DB Browser 등) 와도 충돌 없음.
+    LOAD 경로 전용. 9p / Windows UNC / 절대경로 모두 호환을 위해 시도 순서:
+      1) file URI (`file://...?mode=ro`) — pathlib.Path.as_uri() 로 인코딩.
+         Windows 경로(C:\\..., \\\\wsl$\\...) 와 한글 경로 모두 안전.
+      2) 위 실패 시 일반 connect — PRAGMA journal_mode 변경 없이 busy_timeout
+         만 설정. write 모드지만 LOAD 코드가 INSERT/ALTER 하지 않으므로 lock
+         안 잡음.
     """
-    uri = f"file:{path}?mode=ro"
-    con = sqlite3.connect(uri, uri=True, timeout=timeout)
+    pre_size = os.path.getsize(path) if os.path.exists(path) else -1
+    leftovers = [ext for ext in ("-wal", "-shm", "-journal")
+                 if os.path.exists(path + ext)]
+    print(f"[db-open-read] path={path} pre_size={pre_size} leftovers={leftovers}")
+
+    # 시도 1: file URI ?mode=ro
+    try:
+        import pathlib
+        uri = pathlib.Path(path).as_uri() + "?mode=ro"
+        con = sqlite3.connect(uri, uri=True, timeout=timeout)
+        con.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+        print(f"[db-open-read] ok (uri mode=ro): {uri}")
+        return con
+    except Exception as e:
+        print(f"[db-open-read] URI mode=ro failed: {type(e).__name__}: {e}; "
+              f"falling back to plain connect")
+
+    # 시도 2: 일반 connect (PRAGMA journal_mode 변경 안 함)
+    con = sqlite3.connect(path, timeout=timeout)
     con.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+    print(f"[db-open-read] ok (plain, no pragma change)")
     return con
 
 
