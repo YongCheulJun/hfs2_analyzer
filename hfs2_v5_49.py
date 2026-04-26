@@ -1608,15 +1608,32 @@ def db_save_all(path: str, images: list) -> int:
     return count
 
 
-def _db_open_read(path: str, timeout: float = 15.0) -> sqlite3.Connection:
-    """읽기 전용 open — ALTER/CREATE/PRAGMA journal 변경 시도 안 함.
+# LOAD 경로의 local temp 복사 디렉토리 추적 — 프로세스 종료 시 일괄 정리
+_LOAD_TEMP_DIRS: list = []
 
-    LOAD 경로 전용. 9p / Windows UNC / 절대경로 모두 호환을 위해 시도 순서:
-      1) file URI (`file://...?mode=ro`) — pathlib.Path.as_uri() 로 인코딩.
-         Windows 경로(C:\\..., \\\\wsl$\\...) 와 한글 경로 모두 안전.
-      2) 위 실패 시 일반 connect — PRAGMA journal_mode 변경 없이 busy_timeout
-         만 설정. write 모드지만 LOAD 코드가 INSERT/ALTER 하지 않으므로 lock
-         안 잡음.
+
+def _cleanup_load_temp_dirs():
+    """atexit hook — 프로세스 종료 시 LOAD 임시 디렉토리 정리."""
+    for d in _LOAD_TEMP_DIRS:
+        try:
+            shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+
+
+import atexit as _atexit
+_atexit.register(_cleanup_load_temp_dirs)
+
+
+def _db_open_read(path: str, timeout: float = 15.0) -> sqlite3.Connection:
+    """읽기 전용 open — 9p / Windows UNC / 외부 도구 lock 모두 회피.
+
+    LOAD 경로 전용. 시도 순서:
+      1) file URI ?mode=ro (pathlib.Path(path).resolve().as_uri()) —
+         SQLite 가 read-only 모드로 열어 외부 도구 lock 영향 안 받음.
+      2) src.db → OS local temp 복사 → temp 일반 open. 모든 lock 회피.
+         con close 후 tmp_dir 정리는 프로세스 종료 시 atexit hook 으로.
+      3) 일반 connect — PRAGMA journal_mode 변경 없이 busy_timeout 만.
     """
     pre_size = os.path.getsize(path) if os.path.exists(path) else -1
     leftovers = [ext for ext in ("-wal", "-shm", "-journal")
@@ -1626,16 +1643,40 @@ def _db_open_read(path: str, timeout: float = 15.0) -> sqlite3.Connection:
     # 시도 1: file URI ?mode=ro
     try:
         import pathlib
-        uri = pathlib.Path(path).as_uri() + "?mode=ro"
+        uri = pathlib.Path(path).resolve().as_uri() + "?mode=ro"
         con = sqlite3.connect(uri, uri=True, timeout=timeout)
         con.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
         print(f"[db-open-read] ok (uri mode=ro): {uri}")
         return con
     except Exception as e:
         print(f"[db-open-read] URI mode=ro failed: {type(e).__name__}: {e}; "
-              f"falling back to plain connect")
+              f"trying local temp copy")
 
-    # 시도 2: 일반 connect (PRAGMA journal_mode 변경 안 함)
+    # 시도 2: local temp 복사 후 open (모든 lock 회피)
+    tmp_dir = None
+    try:
+        tmp_dir = tempfile.mkdtemp(prefix="hfs2_load_")
+        tmp_path = os.path.join(tmp_dir, "load.db")
+        shutil.copy2(path, tmp_path)
+        # 동반 lock 파일도 복사 (best-effort — 잠겨있어도 무시)
+        for ext in ("-wal", "-shm", "-journal"):
+            src_ext = path + ext
+            if os.path.exists(src_ext):
+                try: shutil.copy2(src_ext, tmp_path + ext)
+                except OSError: pass
+        con = sqlite3.connect(tmp_path, timeout=timeout)
+        con.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+        _LOAD_TEMP_DIRS.append(tmp_dir)
+        print(f"[db-open-read] ok (local temp copy): {tmp_path}")
+        return con
+    except Exception as e:
+        print(f"[db-open-read] local temp copy failed: "
+              f"{type(e).__name__}: {e}; trying plain connect")
+        if tmp_dir:
+            try: shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception: pass
+
+    # 시도 3: 일반 connect (PRAGMA journal_mode 변경 안 함)
     con = sqlite3.connect(path, timeout=timeout)
     con.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
     print(f"[db-open-read] ok (plain, no pragma change)")
