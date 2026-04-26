@@ -2833,6 +2833,119 @@ class App(_Base):
     # ─────────────────────────────────────────
     #  통합 DB 로드 (이미지 + Raman + 평가대상 한꺼번에)
     # ─────────────────────────────────────────
+    def _report_dataset_summary_html(self, analyzed, raman_data,
+                                     pred_targets, KO=False) -> str:
+        """리포트 4.0 — 데이터셋 요약 (분석/평가/라만 cond·day·갯수).
+
+        세 그룹의 cond/day 분포와 총 갯수를 한 섹션에 정리.
+        """
+        from collections import Counter
+
+        def _esc(s):
+            return (str(s).replace("&", "&amp;")
+                    .replace("<", "&lt;").replace(">", "&gt;"))
+
+        def _group_table(items, title, cond_key, day_key, name_key=None):
+            if not items:
+                msg = "데이터 없음" if KO else "No data"
+                return f"<p><em>{title}: {msg}</em></p>"
+            counts = Counter()
+            for it in items:
+                cond = (it.get(cond_key) or "(미지정)") if KO else (it.get(cond_key) or "(unknown)")
+                day = it.get(day_key) or ""
+                counts[(cond, str(day))] += 1
+            ths = "조건/Cond | 날짜/Day | 갯수/Count" if KO else "Cond | Day | Count"
+            ths_html = "".join(f"<th>{c}</th>"
+                               for c in (ths.split(" | ")))
+            rows_html = ""
+            for i, ((cond, day), n) in enumerate(
+                    sorted(counts.items(),
+                           key=lambda kv: (kv[0][0],
+                                           float(kv[0][1]) if kv[0][1] and kv[0][1].replace('.','',1).replace('-','',1).isdigit() else 9999))):
+                bg = "#f0f4fa" if i % 2 == 0 else "#ffffff"
+                rows_html += (f"<tr style='background:{bg}'>"
+                              f"<td>{_esc(cond)}</td>"
+                              f"<td>{_esc(day)}</td>"
+                              f"<td>{n}</td></tr>")
+            return (f"<h3>{title}  "
+                    f"<span style='color:#888;font-weight:normal;font-size:0.9em'>"
+                    f"(총 {len(items)}건)</span></h3>"
+                    f"<table><thead><tr>{ths_html}</tr></thead>"
+                    f"<tbody>{rows_html}</tbody></table>")
+
+        # 평가대상은 cond_hint + name + day(없을 수 있음) 사용
+        pred_items = []
+        for t in (pred_targets or []):
+            pred_items.append({
+                "cond": t.get("cond_hint") or t.get("cond") or "",
+                "day": t.get("day") or "",
+                "name": t.get("name") or "",
+            })
+
+        title_a = "분석 대상 이미지" if KO else "Analyzed Images"
+        title_p = "평가 대상 이미지" if KO else "Evaluation Targets"
+        title_r = "라만 데이터" if KO else "Raman Data"
+
+        return (_group_table(analyzed, title_a, "cond", "day")
+                + _group_table(pred_items, title_p, "cond", "day", "name")
+                + _group_table(list(raman_data or []), title_r, "cond", "day"))
+
+    def _report_pred_targets_detail_html(self, pred_targets,
+                                         eval_ctx, KO=False) -> str:
+        """리포트 6.x — 평가대상별 상세 정보 (cond, day, ROI, 분석 결과).
+
+        eval_ctx 는 단일 활성 평가대상 결과만 보유 — 각 평가대상 카드의
+        분석 결과는 self._pred_targets[i].get("result") 에서 가져옴.
+        """
+        if not pred_targets:
+            msg = ("평가 대상 이미지가 없다." if KO
+                   else "No evaluation targets.")
+            return f"<p><em>{msg}</em></p>"
+
+        def _esc(s):
+            return (str(s).replace("&", "&amp;")
+                    .replace("<", "&lt;").replace(">", "&gt;"))
+
+        def fv(v, d=2):
+            try: return f"{float(v):.{d}f}"
+            except: return "-"
+
+        if KO:
+            hdrs = ["#", "이름", "조건", "날짜",
+                    "ROI", "b*", "S-ch", "YI", "추정일", "신뢰도"]
+        else:
+            hdrs = ["#", "Name", "Cond", "Day",
+                    "ROI", "b*", "S-ch", "YI", "Est.Day", "Conf"]
+
+        rows_html = ""
+        for i, t in enumerate(pred_targets, 1):
+            res = t.get("result") or {}
+            roi = t.get("roi") or (None,)*4
+            roi_str = (f"{roi[0]},{roi[1]}-{roi[2]},{roi[3]}"
+                       if all(v is not None for v in roi[:4]) else "-")
+            stats = res.get("stats") or {}
+            est = res.get("est_day")
+            conf = res.get("confidence")
+            row = [
+                str(i),
+                _esc(t.get("name", "")[:32]),
+                _esc(t.get("cond_hint") or t.get("cond") or ""),
+                _esc(t.get("day") or ""),
+                roi_str,
+                fv(stats.get("lab_b") if stats else None),
+                fv(stats.get("s_mean") if stats else None, 0),
+                fv(stats.get("yellowness_idx") if stats else None, 0),
+                (fv(est, 1) + ("일" if KO else "d")) if est is not None else "-",
+                (fv(conf, 0) + "%") if conf is not None else "-",
+            ]
+            bg = "#f0f4fa" if i % 2 == 0 else "#ffffff"
+            tds = "".join(f"<td>{c}</td>" for c in row)
+            rows_html += f"<tr style='background:{bg}'>{tds}</tr>"
+        ths_html = "".join(f"<th>{h}</th>" for h in hdrs)
+        return ("<table><thead><tr>" + ths_html
+                + "</tr></thead><tbody>" + rows_html
+                + "</tbody></table>")
+
     def _generate_report(self):
         """보고서 생성 — 영문/한글 동시, 워드(.docx) 또는 HTML 선택"""
         fmt_win = tk.Toplevel(self)
@@ -2957,9 +3070,25 @@ class App(_Base):
                 except Exception:
                     pass
 
+            # 평가 대상 (self._pred_targets) snapshot — 리포트 데이터셋
+            # 요약/평가대상 상세 섹션에 사용. tk 변수와 numpy 배열 등은 제외.
+            pred_targets = []
+            for t in getattr(self, "_pred_targets", []) or []:
+                pred_targets.append({
+                    "tid":       t.get("tid"),
+                    "name":      t.get("name", ""),
+                    "cond":      t.get("cond", ""),
+                    "cond_hint": t.get("cond_hint", ""),
+                    "day":       t.get("day", ""),
+                    "roi":       t.get("roi"),
+                    "color":     t.get("color"),
+                    "result":    t.get("result"),
+                })
+
             gen_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
             args = (analyzed, raman_data, eval_ctx,
-                    chart_b64, eval_comment, pseudo_result, gen_time)
+                    chart_b64, eval_comment, pseudo_result, gen_time,
+                    pred_targets)
 
             # ── 영문 생성 ─────────────────────────
             if fmt == "html":
@@ -2978,8 +3107,10 @@ class App(_Base):
             messagebox.showinfo("보고서 생성 완료",
                 f"영문: {os.path.basename(path_en)}\n"
                 f"한글: {os.path.basename(path_ko)}\n\n"
-                f"  이미지 {len(analyzed)}개 | Raman {len(raman_data)}건 "
-                f"| 차트 {len(chart_b64)}개" + tip)
+                f"  분석 이미지 {len(analyzed)}개 | "
+                f"평가대상 {len(pred_targets)}개 | "
+                f"Raman {len(raman_data)}건 | "
+                f"차트 {len(chart_b64)}개" + tip)
 
         except Exception as ex:
             self._set_status("Report generation failed.")
@@ -4274,7 +4405,8 @@ The results are integrated into a final oxidation stage assessment (Stage I–IV
 
     def _build_report_html(self, images, raman_data, eval_ctx,
                             chart_b64, eval_comment,
-                            pseudo_result, gen_time, lang="en") -> str:
+                            pseudo_result, gen_time,
+                            pred_targets=None, lang="en") -> str:
         KO = (lang == "ko")
         def fv(v, d=2):
             try: return f"{float(v):.{d}f}"
@@ -4468,13 +4600,15 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             s_flow  = "1. 분석 전체 흐름 (Analysis Workflow)"
             s_color = "2. 색상 모델 및 산화 지표 (Color Models & Oxidation Metrics)"
             s_meth  = "3. 추정 방법론 (Estimation Methodology)"
-            s_img   = "4. 이미지 분석 데이터 (Image Analysis Data)"
-            s_raman = "5. 라만 참조 데이터 (Raman Reference Data)"
-            s_eval  = "6. 평가 결과 (Evaluation Results)"
-            s_est_c = "6.1 날짜 추정 근거 (Date Estimation Comment)"
-            s_psr   = "6.2 Pseudo-Raman 추정 상세"
-            s_guide = "7. 차트 해석 가이드 (Chart Guide)"
-            s_final = "8. 최종 분석 의견 (Final Analytical Opinion)"
+            s_dset  = "4. 데이터셋 요약 (Dataset Summary)"
+            s_img   = "5. 이미지 분석 데이터 (Image Analysis Data)"
+            s_raman = "6. 라만 참조 데이터 (Raman Reference Data)"
+            s_eval  = "7. 평가 결과 (Evaluation Results)"
+            s_pred  = "7.1 평가 대상 상세 (Evaluation Targets — Detail)"
+            s_est_c = "7.2 날짜 추정 근거 (Date Estimation Comment)"
+            s_psr   = "7.3 Pseudo-Raman 추정 상세"
+            s_guide = "8. 차트 해석 가이드 (Chart Guide)"
+            s_final = "9. 최종 분석 의견 (Final Analytical Opinion)"
             cover_title  = "HfS₂ 박막 산화도 분석 보고서"
             cover_sub    = "다채널 색상계 분석 + Pseudo-Raman 추정"
             cover_gen    = "생성일시: " + gen_time
@@ -4491,7 +4625,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             s_flow  = "1. Analysis Workflow Overview"
             s_color = "2. Color Space Models and Oxidation Metrics"
             s_meth  = "3. Estimation Methodology"
-            s_img   = "4. Image Analysis Data"
+            s_dset  = "4. Dataset Summary"
+            s_img   = "5. Image Analysis Data"
             s_raman = "5. Raman Reference Data"
             s_eval  = "6. Evaluation Results"
             s_est_c = "6.1 Date Estimation Comment"
@@ -4514,9 +4649,9 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         adv_ctx = getattr(self, "_last_adv_ctx", None)
         if adv_ctx:
             if KO:
-                s_adv = "9. 고급 분석 결과 (Advanced Analysis)"
+                s_adv = "10. 고급 분석 결과 (Advanced Analysis)"
             else:
-                s_adv = "9. Advanced Analysis Results"
+                s_adv = "10. Advanced Analysis Results"
             adv_part = self._report_adv_section(adv_ctx, ko=KO)
         else:
             s_adv = ""
@@ -4525,9 +4660,16 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         # ── 참고문헌 ──────────────────────────────────────
         ref_section = self._report_references(ko=KO)
         if KO:
-            s_ref = "10. 참고문헌 (References)"
+            s_ref = "11. 참고문헌 (References)"
         else:
-            s_ref = "10. References"
+            s_ref = "11. References"
+
+        # 4. 데이터셋 요약 (분석/평가/라만 cond·day·갯수)
+        dset_html = self._report_dataset_summary_html(
+            images, raman_data, pred_targets, KO=KO)
+        # 7.1 평가 대상 상세
+        pred_detail = self._report_pred_targets_detail_html(
+            pred_targets, eval_ctx, KO=KO)
 
         return (
             "<!DOCTYPE html>\n<html lang=\"" + ("ko" if KO else "en") + "\">\n<head>\n"
@@ -4545,11 +4687,13 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             + sec(s_flow,  flow_txt)
             + sec(s_color, "<p>" + color_txt + "</p>")
             + sec(s_meth,  "<p>" + meth_txt  + "</p>")
+            + sec(s_dset,  dset_html)
             + sec(s_img,   "<p>" + img_count + "</p>" + img_tbl + thumbs)
             + sec(s_raman,
                   ("<p>" + r_count + "</p>" + raman_tbl + raman_charts)
                   if raman_data else no_raman)
             + sec(s_eval, eval_part)
+            + sec(s_pred, pred_detail, 3)
             + (sec(s_est_c, pre(eval_comment), 3) if eval_comment else "")
             + (sec(s_psr,   pre(pseudo_result), 3) if pseudo_result else "")
             + sec(s_guide, "<p>" + guide_txt + "</p>")
@@ -4824,9 +4968,10 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
 </li>
 </ol>"""
 
-    def _build_report_docx(self, path, images, raman_data, eval_ctx,
+    def _build_report_docx(self, path, images, raman_data, eval_ctx,  # noqa: C901
                              chart_b64, eval_comment,
-                             pseudo_result, gen_time, lang="en"):
+                             pseudo_result, gen_time,
+                             pred_targets=None, lang="en"):
         from docx import Document
         from docx.shared import Inches, Pt, RGBColor, Cm
         from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -4952,7 +5097,49 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             for line in body.split("\n"):
                 if line.strip(): ap(line, size=10)
 
-        ah("4. 이미지 분석 데이터" if KO else "4. Image Analysis Data")
+        # ── 4. 데이터셋 요약 ─────────────────────────
+        ah("4. 데이터셋 요약 (Dataset Summary)" if KO
+           else "4. Dataset Summary")
+        from collections import Counter as _Counter
+
+        def _docx_group_table(items, label, cond_key, day_key):
+            n_items = len(items or [])
+            ap(f"{label}: " + (f"총 {n_items}건" if KO else f"{n_items} entries"),
+               bold=True)
+            if not items:
+                return
+            counts = _Counter()
+            for it in items:
+                cond = it.get(cond_key) or ("(미지정)" if KO else "(unknown)")
+                day = str(it.get(day_key) or "")
+                counts[(cond, day)] += 1
+            hdrs = (["조건(Cond)", "날짜(Day)", "갯수(Count)"] if KO
+                    else ["Cond", "Day", "Count"])
+            rows = []
+            for (cond, day), n in sorted(
+                    counts.items(),
+                    key=lambda kv: (kv[0][0],
+                                    float(kv[0][1]) if kv[0][1].replace('.','',1).replace('-','',1).isdigit() else 9999)):
+                rows.append([cond, day, str(n)])
+            add_tbl(hdrs, rows)
+
+        _docx_group_table(images,
+                          ("분석 대상 이미지" if KO else "Analyzed Images"),
+                          "cond", "day")
+        _pred_items = []
+        for t in (pred_targets or []):
+            _pred_items.append({
+                "cond": t.get("cond_hint") or t.get("cond") or "",
+                "day": t.get("day") or "",
+            })
+        _docx_group_table(_pred_items,
+                          ("평가 대상 이미지" if KO else "Evaluation Targets"),
+                          "cond", "day")
+        _docx_group_table(list(raman_data or []),
+                          ("라만 데이터" if KO else "Raman Data"),
+                          "cond", "day")
+
+        ah("5. 이미지 분석 데이터" if KO else "5. Image Analysis Data")
         ap(f"Total analyzed images: {len(images)}", bold=True)
         if images:
             if KO:
@@ -4965,8 +5152,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                      i["yi"], i["de"], i["yr"]] for i in images[:40]]
             add_tbl(hdrs, rows)
 
-        ah("5. 라만 참조 데이터 (Raman Reference Data)" if KO
-           else "5. Raman Reference Data")
+        ah("6. 라만 참조 데이터 (Raman Reference Data)" if KO
+           else "6. Raman Reference Data")
         if raman_data:
             ap(f"{'총 라만 데이터' if KO else 'Total entries'}: {len(raman_data)}",
                bold=True)
@@ -5010,8 +5197,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                         if line.strip(): ap(line, size=9)
                     doc.add_paragraph()
 
-        ah("6. 평가 결과 (Evaluation Results)" if KO
-           else "6. Evaluation Results")
+        ah("7. 평가 결과 (Evaluation Results)" if KO
+           else "7. Evaluation Results")
         if eval_ctx.get("target"):
             est  = eval_ctx.get("est_day"); conf = eval_ctx.get("confidence",0)
             tgt2 = eval_ctx.get("target",{})
@@ -5070,14 +5257,46 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 for l in pseudo_result.split("\n"):
                     if l.strip(): ap(l, size=9)
 
-        ah("7. 차트 해석 가이드 (Chart Interpretation Guide)" if KO
-           else "7. Chart Interpretation Guide")
+        # ── 7.x 평가 대상 상세 ─────────────────────────
+        if pred_targets:
+            ah("평가 대상 상세 (Evaluation Targets — Detail)" if KO
+               else "Evaluation Targets — Detail", level=2)
+            ap(("총 " if KO else "Total: ") + str(len(pred_targets))
+               + ("개 평가 대상" if KO else " evaluation target(s)"),
+               bold=True, size=10)
+            if KO:
+                p_h = ["#", "이름", "조건", "날짜", "ROI",
+                       "추정일(d)", "신뢰도(%)"]
+            else:
+                p_h = ["#", "Name", "Cond", "Day", "ROI",
+                       "Est.Day", "Conf"]
+            p_r = []
+            for i, t in enumerate(pred_targets, 1):
+                roi = t.get("roi") or (None,)*4
+                roi_str = (f"{roi[0]},{roi[1]}-{roi[2]},{roi[3]}"
+                           if all(v is not None for v in roi[:4]) else "-")
+                res = t.get("result") or {}
+                est = res.get("est_day")
+                conf = res.get("confidence")
+                p_r.append([
+                    str(i),
+                    (t.get("name", "") or "")[:24],
+                    t.get("cond_hint") or t.get("cond") or "",
+                    str(t.get("day", "") or ""),
+                    roi_str,
+                    fv(est, 1) if est is not None else "-",
+                    fv(conf, 0) if conf is not None else "-",
+                ])
+            add_tbl(p_h, p_r)
+
+        ah("8. 차트 해석 가이드 (Chart Interpretation Guide)" if KO
+           else "8. Chart Interpretation Guide")
         guide = self._report_chart_guide_ko() if KO else self._report_chart_guide()
         for line in guide.split("\n"):
             if line.strip(): ap(line, size=10)
 
-        ah("8. 최종 분석 의견 (Final Analytical Opinion)" if KO
-           else "8. Final Analytical Opinion")
+        ah("9. 최종 분석 의견 (Final Analytical Opinion)" if KO
+           else "9. Final Analytical Opinion")
         for line in self._report_final_opinion(
                 images, eval_ctx, eval_comment, pseudo_result,
                 ko=KO).split("\n"):
@@ -5086,8 +5305,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         # ── 9. Advanced 분석 결과 ──────────────────────────
         adv_ctx = getattr(self, "_last_adv_ctx", None)
         if adv_ctx:
-            ah("9. 고급 분석 결과 (Advanced Analysis)" if KO
-               else "9. Advanced Analysis Results")
+            ah("10. 고급 분석 결과 (Advanced Analysis)" if KO
+               else "10. Advanced Analysis Results")
             def fmt_d(day, conf):
                 return f"{day:.1f}일 ({conf:.0f}%)" if day is not None else "N/A"
 
@@ -5125,7 +5344,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                    f"anisotropy={ts.get('anisotropy',1):.3f}", size=9)
 
         # ── 10. 참고문헌 ───────────────────────────────────
-        ah("10. 참고문헌 (References)" if KO else "10. References")
+        ah("11. 참고문헌 (References)" if KO else "11. References")
         refs = [
             ("Hwang, J., Mun, J., Lee, K.-T., Lee, T., Kim, J., Min, J., "
              "& Park, K. (2025). Impact of humidity on long-term stability "
@@ -5901,15 +6120,15 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                   relief="flat", padx=4, pady=2,
                   cursor="hand2").pack(side="left", expand=True,
                                        fill="x", padx=(0,1))
-        tk.Button(sub_row, text="💾",
+        tk.Button(sub_row, text=_L("💾 평가대상 저장","💾 Save Targets"),
                   command=self._db_save_target,
                   bg=BTN, fg=TXT, font=LF,
-                  relief="flat", padx=4, pady=2,
+                  relief="flat", padx=6, pady=2,
                   cursor="hand2").pack(side="left", padx=1)
-        tk.Button(sub_row, text="📂",
+        tk.Button(sub_row, text=_L("📂 평가대상 불러오기","📂 Load Targets"),
                   command=self._pred_load_target_dialog,
                   bg=BTN, fg=TXT, font=LF,
-                  relief="flat", padx=4, pady=2,
+                  relief="flat", padx=6, pady=2,
                   cursor="hand2").pack(side="left", padx=1)
 
         tk.Frame(left, bg=BORDER, height=1).pack(fill="x", padx=8, pady=2)
