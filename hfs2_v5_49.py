@@ -6174,7 +6174,11 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 "Save a target first using [💾 Save Target].")
 
     def _db_save_target(self):
-        """평가 대상 이미지 별도 저장 (다중 target)"""
+        """평가 대상 이미지 별도 저장 (다중 target).
+
+        9p / Windows UNC 마운트의 SQLite lock 회피 위해 local temp 에서
+        SQLite 작업 후 shutil.move 로 dst 에 이동 (_db_save 와 동일 패턴).
+        """
         if not self._pred_targets:
             messagebox.showwarning("Warning",
                 "No evaluation target loaded.\nAdd targets in the [🎯 Evaluation] tab first.")
@@ -6184,12 +6188,23 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             defaultextension=".target.db",
             filetypes=[("Target DB","*.target.db *.db"),("All","*.*")])
         if not path: return
+
+        tmp_dir  = tempfile.mkdtemp(prefix="hfs2_save_target_")
+        tmp_path = os.path.join(tmp_dir, "save.db")
+        dst_pre = os.path.getsize(path) if os.path.exists(path) else -1
+        leftovers = [ext for ext in ("-wal", "-shm", "-journal")
+                     if os.path.exists(path + ext)]
+        print(f"[_db_save_target] === START ===")
+        print(f"[_db_save_target] dst={path} pre_size={dst_pre} "
+              f"leftovers={leftovers}")
+        print(f"[_db_save_target] tmp={tmp_path} (local temp)")
+        print(f"[_db_save_target] targets={len(self._pred_targets)}")
+
         try:
             import sqlite3 as _sq, pickle as _pk, json as _js
-            con = _db_open_safe(path)
+            con = _db_open_safe(tmp_path)
             n_saved = 0
             try:
-                con.execute("PRAGMA busy_timeout=15000")
                 _migrate_eval_target_schema(con)
                 con.execute("DELETE FROM eval_target")
                 for t in self._pred_targets:
@@ -6212,13 +6227,37 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 # 마이그레이션 백업 정리
                 con.execute("DROP TABLE IF EXISTS eval_target_v1_backup")
                 con.commit()
+                print(f"[_db_save_target] inserts={n_saved} commit ok")
             finally:
                 con.close()
+
+            # 기존 dst + lock 잔재 정리 후 shutil.move
+            for ext in ("", "-wal", "-shm", "-journal"):
+                target = path + ext
+                if os.path.exists(target):
+                    try: os.remove(target)
+                    except OSError as e:
+                        print(f"[_db_save_target] WARN cannot remove "
+                              f"{target}: {e}")
+            print(f"[_db_save_target] shutil.move -> {path}")
+            shutil.move(tmp_path, path)
+            try: shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception: pass
+            final_size = os.path.getsize(path) if os.path.exists(path) else -1
+            print(f"[_db_save_target] === DONE === dst_size={final_size} "
+                  f"records={n_saved}")
+
             messagebox.showinfo("Saved",
                 f"{n_saved} evaluation target(s) saved.\n{path}")
             self._set_status(
                 f"🎯 {n_saved} target(s) saved: {os.path.basename(path)}")
         except Exception as ex:
+            import traceback
+            print(f"[_db_save_target] === FAILED === "
+                  f"{type(ex).__name__}: {ex}")
+            traceback.print_exc()
+            try: shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception: pass
             messagebox.showerror("Save Error", str(ex))
 
     def _pred_load_rows(self, rows) -> int:
@@ -6324,7 +6363,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         return False
 
     def _db_save_raman(self):
-        """Raman 데이터 별도 저장"""
+        """Raman 데이터 별도 저장. 9p lock 회피 위해 local temp + shutil.move."""
         if not self._raman_data:
             messagebox.showwarning("Warning",
                 "No Raman data loaded.\n"
@@ -6335,38 +6374,66 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             defaultextension=".raman.db",
             filetypes=[("Raman DB","*.raman.db *.db"),("All","*.*")])
         if not path: return
+
+        tmp_dir  = tempfile.mkdtemp(prefix="hfs2_save_raman_")
+        tmp_path = os.path.join(tmp_dir, "save.db")
+        print(f"[_db_save_raman] === START === dst={path}")
+        print(f"[_db_save_raman] tmp={tmp_path} entries={len(self._raman_data)}")
+
         try:
             import sqlite3 as _sq, json as _js
-            con = _db_open_safe(path)
-            con.execute("""CREATE TABLE IF NOT EXISTS raman_data
-                (id INTEGER PRIMARY KEY,
-                 cond TEXT, day TEXT, peak REAL,
-                 norm_peak REAL, peak_shift REAL,
-                 peak_range TEXT, spectrum_json TEXT,
-                 saved_at TEXT)""")
-            con.execute("DELETE FROM raman_data")
-            for r in self._raman_data:
-                spec_j = (_js.dumps(r["spectrum"])
-                          if r.get("spectrum") else None)
-                con.execute(
-                    "INSERT INTO raman_data"
-                    " (cond,day,peak,norm_peak,peak_shift,"
-                    "  peak_range,spectrum_json,saved_at)"
-                    " VALUES (?,?,?,?,?,?,?,datetime('now','localtime'))",
-                    (r.get("cond",""), r.get("day",""),
-                     float(r.get("peak",0)),
-                     float(r.get("norm_peak") or 0),
-                     float(r.get("peak_shift") or 0),
-                     str(r.get("peak_range","")),
-                     spec_j))
-            con.commit(); con.close()
+            con = _db_open_safe(tmp_path)
+            try:
+                con.execute("""CREATE TABLE IF NOT EXISTS raman_data
+                    (id INTEGER PRIMARY KEY,
+                     cond TEXT, day TEXT, peak REAL,
+                     norm_peak REAL, peak_shift REAL,
+                     peak_range TEXT, spectrum_json TEXT,
+                     saved_at TEXT)""")
+                con.execute("DELETE FROM raman_data")
+                for r in self._raman_data:
+                    spec_j = (_js.dumps(r["spectrum"])
+                              if r.get("spectrum") else None)
+                    con.execute(
+                        "INSERT INTO raman_data"
+                        " (cond,day,peak,norm_peak,peak_shift,"
+                        "  peak_range,spectrum_json,saved_at)"
+                        " VALUES (?,?,?,?,?,?,?,datetime('now','localtime'))",
+                        (r.get("cond",""), r.get("day",""),
+                         float(r.get("peak",0)),
+                         float(r.get("norm_peak") or 0),
+                         float(r.get("peak_shift") or 0),
+                         str(r.get("peak_range","")),
+                         spec_j))
+                con.commit()
+            finally:
+                con.close()
+
+            for ext in ("", "-wal", "-shm", "-journal"):
+                target = path + ext
+                if os.path.exists(target):
+                    try: os.remove(target)
+                    except OSError as e:
+                        print(f"[_db_save_raman] WARN remove {target}: {e}")
+            print(f"[_db_save_raman] shutil.move -> {path}")
+            shutil.move(tmp_path, path)
+            try: shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception: pass
+
             n = len(self._raman_data)
             conds = list(dict.fromkeys(r["cond"] for r in self._raman_data))
+            print(f"[_db_save_raman] === DONE === n={n}")
             messagebox.showinfo("Saved",
                 f"Saved {n} Raman entries.\nConditions: {', '.join(conds[:5])}\n{path}")
             self._set_status(
                 f"📡 Raman saved: {n} entries  ({os.path.basename(path)})")
         except Exception as ex:
+            import traceback
+            print(f"[_db_save_raman] === FAILED === "
+                  f"{type(ex).__name__}: {ex}")
+            traceback.print_exc()
+            try: shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception: pass
             messagebox.showerror("Save Error", str(ex))
 
     def _raman_load_db_dialog(self):
