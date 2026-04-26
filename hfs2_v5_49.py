@@ -6672,6 +6672,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         color = self._pred_assign_color()
         cond_hint = (self._pred_cond_var.get().strip()
                      if hasattr(self, "_pred_cond_var") else "")
+        # 파일명 파싱 — day/cond 자동 (분석대상 매칭 + ground truth 용)
+        parsed_day, parsed_cond = parse_filename_tags(name) if name else ("", "")
         try:
             thumb = make_thumb(rgb, 90, 70, auto_roi)
         except Exception:
@@ -6687,7 +6689,9 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             "roi_source":  "auto",
             "color":       color,
             "thumb":       thumb,
-            "cond_hint":   cond_hint,
+            "cond_hint":   cond_hint or parsed_cond,
+            "cond":        parsed_cond,
+            "day":         parsed_day,
             "result":      None,
         }
         self._pred_targets.append(target)
@@ -9098,16 +9102,33 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                    "LOAD an analyzed DB (e.g., pkw_1.db) first."))
             return
 
-        # 평가대상 → 분석대상 매칭 (name 우선, cond+day fallback)
+        # 평가대상 → 분석대상 매칭. 우선순위:
+        #   ① 정확 name 일치
+        #   ② 확장자 무시 stem 일치 (.jpg ↔ .png 등)
+        #   ③ cond + day 일치 (평가대상 cond/day 가 비어있으면 파일명 파싱)
+        def _stem(s: str) -> str:
+            return _re.sub(r'\.(jpg|jpeg|png|bmp|tiff|tif)$',
+                           '', s or '', flags=_re.IGNORECASE)
+
         img_by_name = {img.get("name"): img for img in self.images}
+        img_by_stem = {_stem(img.get("name", "")): img
+                       for img in self.images}
+
         gt_pairs = []
         unmatched = []
         for t in self._pred_targets:
             nm = t.get("name", "") or ""
             match = img_by_name.get(nm)
             if match is None:
-                cnd = (t.get("cond_hint") or "").strip()
+                match = img_by_stem.get(_stem(nm))
+            if match is None:
+                # cond + day 매칭 (평가대상 정보 + 파일명 파싱 폴백)
+                cnd = (t.get("cond_hint") or t.get("cond") or "").strip()
                 day_hint = str(t.get("day") or "").strip()
+                if (not cnd or not day_hint) and nm:
+                    p_day, p_cond = parse_filename_tags(nm)
+                    if not cnd: cnd = p_cond
+                    if not day_hint: day_hint = p_day
                 if cnd and day_hint:
                     for img in self.images:
                         if (img.get("cond") == cnd
