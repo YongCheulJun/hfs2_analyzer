@@ -460,40 +460,65 @@ def _find_most_curved_side_midpoint(contour, sx, sy, sbw, sbh):
     return None
 
 
+# cond 별 학습된 ROI 면적 비율 (이미지 면적 대비).
+# 사용자 수동 정답(roi_mod.db, 33장) cond별 평균값:
+#   NativeHfS2-35%RH n=5  mean=0.128  median=0.129
+#   NativeHfS2-70%RH n=11 mean=0.150  median=0.160
+#   Al2O3HfS2-70%RH  n=12 mean=0.172  median=0.177
+#   PMMA HfS2-70%RH  n=5  mean=0.151  median=0.136
+# 여기 없는 cond 는 DEFAULT_AREA_RATIO 사용.
+COND_AREA_RATIOS = {
+    "NativeHfS2-35%RH": 0.13,
+    "NativeHfS2-70%RH": 0.15,
+    "Al2O3HfS2-70%RH": 0.17,
+    "PMMA HfS2-70%RH": 0.15,
+}
+DEFAULT_AREA_RATIO = 0.15
+
+
+def _resolve_area_ratio(cond) -> float:
+    if not cond:
+        return DEFAULT_AREA_RATIO
+    return COND_AREA_RATIOS.get(str(cond).strip(), DEFAULT_AREA_RATIO)
+
+
 def auto_detect_roi(rgb: np.ndarray,
                     paper_v_thresh: int = 215,
                     paper_s_thresh: int = 25,
-                    target_area_ratio: float = 0.13,
+                    target_area_ratio: float = None,
                     max_specimen_fraction: float = 0.70,
                     edge_margin_ratio: float = 0.05,
-                    bias_ratio: float = 0.25,
+                    bias_ratio: float = 0.0,
                     min_area_ratio: float = 0.03,
-                    paper_inside_ratio: float = 0.02) -> tuple:
+                    paper_inside_ratio: float = 0.02,
+                    cond=None) -> tuple:
     """
     HfS₂ 시편 사진에서 자동 ROI 추정.
 
-    DB pkw_1.db 의 사용자 패턴 + 사용자 추가 요구:
-      - ROI 면적 ≈ 이미지의 13% (DB 23.8% 보다 약 45% 작게)
-      - ROI 중심 ≈ 시편 bbox 중심에서 **곡률이 가장 큰 변의 중심에서
-        가장 먼 꼭지점 쪽** 으로 25% 이동
-      - 가로/세로 비 = 시편 bbox 비율
+    사용자 수동 정답(roi_mod.db) 분석 기반:
+      - ROI 면적 ≈ cond 별 학습 비율 (기본 22%, COND_AREA_RATIOS)
+      - ROI 중심 = 시편 mass-centroid (사용자 의도: "시편 중심부 안전영역")
+      - 가로/세로 비 = (시편 bbox AR) ** 0.5  — 정사각형 쪽으로 완화
       - 이미지 가장자리 5% 안쪽 보장
+      - paper mask: 이미지별 V/S 적응 임계 + convex hull 로 광택 반사 흡수
 
     알고리즘:
-    1) HSV V/S 로 paper 마스크 추출
-    2) non_paper 형태학 정리 (open + close)
-    3) 가장 큰 contour 의 bbox = 시편 bbox (sx, sy, sbw, sbh)
-    4) `_find_most_curved_side_midpoint` — 곡률 가장 큰 사이드 중점 검출
-    5) `_find_corner_far_from_curved_side` — approxPolyDP polygon 의
-       꼭지점 중 curved_mid 에서 가장 먼 vertex 검출
-    6) 목표 ROI 너비/높이 산출 (target_area_ratio + aspect)
-    7) ROI 중심 = bbox 중심 + (먼 꼭지점 - bbox 중심) × bias_ratio
-       곡률 큰 변에서 가장 먼 꼭지점 방향으로 이동
-       (꼭지점은 bbox 모서리 근처라 vector 거리가 사이드 중점보다 길어
-        bias_ratio 를 0.30→0.25 로 살짝 낮춰 비슷한 변위 유지)
-       못 찾으면 bbox 중심 그대로
-    8) edge_margin_ratio (5%) 안쪽으로 밀어넣기
-    9) 품질 평가: 면적 / 가장자리 근접 / paper 비율
+    1) HSV V/S 적응 임계 → paper 마스크
+    2) non_paper 형태학 정리 (close → open) + 가장 큰 contour
+    3) convex hull 로 시편 bbox 산출 (광택 반사 hole 회복)
+    4) ROI 면적 = img_area × _resolve_area_ratio(cond), AR = sqrt(sbw/sbh)
+    5) ROI 중심 = mass-centroid (cv2.moments). pointPolygonTest 로 내부 보장.
+    6) edge_margin_ratio (5%) 안쪽으로 밀어넣기
+    7) 품질 평가: 면적 / 가장자리 근접 / paper 비율
+
+    Parameters
+    ----------
+    target_area_ratio : float | None
+        None 이면 cond 기반 자동. 명시값이 있으면 그 값을 강제.
+    bias_ratio : float
+        과거 호환용 인자. 0.0 (기본) 이면 mass-centroid 그대로 사용.
+    cond : str | None
+        cond 문자열. COND_AREA_RATIOS 룩업에 사용.
 
     Returns
     -------
@@ -505,33 +530,50 @@ def auto_detect_roi(rgb: np.ndarray,
     img_area = h * w
     default_roi = (w // 4, h // 4, 3 * w // 4, 3 * h // 4)
 
+    if target_area_ratio is None:
+        target_area_ratio = _resolve_area_ratio(cond)
+
     try:
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         S = hsv[:, :, 1]
         V = hsv[:, :, 2]
-        paper = (V > paper_v_thresh) & (S < paper_s_thresh)
+        # 적응 임계 (보수): V 92퍼센타일이 기본보다 *조금만* 높으면 채택,
+        # 너무 크면 (시편을 paper 로 흡수) 거부. 70%RH 광택 케이스 보호용.
+        v_hi = paper_v_thresh
+        v_p92 = int(np.percentile(V, 92))
+        if paper_v_thresh < v_p92 < paper_v_thresh + 20:
+            v_hi = v_p92
+        paper = (V > v_hi) & (S < paper_s_thresh)
         non_paper = (~paper).astype(np.uint8) * 255
 
-        # 형태학 정리
+        # 형태학 정리 — close 를 먼저 해 시편 내부 hole 흡수
         k_clean = max(7, min(h, w) // 80)
         if k_clean % 2 == 0:
             k_clean += 1
         kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_clean, k_clean))
-        non_paper = cv2.morphologyEx(non_paper, cv2.MORPH_OPEN, kern)
         non_paper = cv2.morphologyEx(non_paper, cv2.MORPH_CLOSE, kern)
+        non_paper = cv2.morphologyEx(non_paper, cv2.MORPH_OPEN, kern)
 
         contours, _ = cv2.findContours(
             non_paper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return default_roi, "failed", "시편 영역을 찾지 못함 — 수동 설정 필요"
         c = max(contours, key=cv2.contourArea)
+
+        # convex hull — 시편 내부 hole(광택 반사) 흡수.
+        # 단, hull 이 이미지의 90% 이상이면 거부 (시편 검출 실패의 fallback 으로 보호)
+        hull = cv2.convexHull(c)
+        if cv2.contourArea(hull) < 0.9 * img_area:
+            c = hull
+
         sx, sy, sbw, sbh = cv2.boundingRect(c)
         if sbw < 10 or sbh < 10:
             return default_roi, "failed", "시편 영역이 너무 작음"
 
-        # 목표 ROI 크기 — 면적 비율 + 시편 모양 aspect
+        # 목표 ROI 크기 — 면적 비율 + 시편 모양 AR^0.5 완화
         target_area = img_area * target_area_ratio
-        aspect = sbw / sbh if sbh > 0 else 1.0
+        raw_aspect = sbw / sbh if sbh > 0 else 1.0
+        aspect = raw_aspect ** 0.5  # 정사각형 쪽으로 완화 (사용자 수동 평균 AR≈1.07)
         roi_w = int((target_area * aspect) ** 0.5)
         roi_h = int((target_area / aspect) ** 0.5)
         roi_w = min(roi_w, int(sbw * max_specimen_fraction))
@@ -539,16 +581,30 @@ def auto_detect_roi(rgb: np.ndarray,
         roi_w = max(roi_w, int(min(w, sbw) * 0.18))
         roi_h = max(roi_h, int(min(h, sbh) * 0.18))
 
-        # ROI 중심 — 곡률 큰 변 중심에서 가장 먼 꼭지점 쪽으로 이동
+        # ROI 중심 — 시편 bbox 중심과 mass-centroid 의 평균
+        # (사용자 수동 패턴 분석: 순수 bbox 중심보다 약간 mass 쪽,
+        #  순수 mass-centroid 보다 약간 bbox 쪽이 가장 잘 맞음.
+        #  비대칭 시편에서도 두 점 평균이 안전영역 중심에 가까움)
         cx_base = sx + sbw / 2
         cy_base = sy + sbh / 2
-        curved_pt = _find_most_curved_side_midpoint(c, sx, sy, sbw, sbh)
-        far_vertex = _find_corner_far_from_curved_side(c, curved_pt)
-        if far_vertex is not None:
-            cx = cx_base + (far_vertex[0] - cx_base) * bias_ratio
-            cy = cy_base + (far_vertex[1] - cy_base) * bias_ratio
+        M = cv2.moments(c)
+        if M["m00"] > 0:
+            cx_mass = M["m10"] / M["m00"]
+            cy_mass = M["m01"] / M["m00"]
         else:
-            cx, cy = cx_base, cy_base
+            cx_mass, cy_mass = cx_base, cy_base
+        # contour 외부에 떨어지는 thin-shell 케이스 가드
+        if cv2.pointPolygonTest(c, (float(cx_mass), float(cy_mass)), False) < 0:
+            cx_mass, cy_mass = cx_base, cy_base
+        cx = (cx_base + cx_mass) / 2
+        cy = (cy_base + cy_mass) / 2
+        # bias_ratio > 0 이면 과거 호환 모드: 곡률 큰 변에서 먼 꼭지점 쪽으로 추가 이동
+        if bias_ratio > 0:
+            curved_pt = _find_most_curved_side_midpoint(c, sx, sy, sbw, sbh)
+            far_vertex = _find_corner_far_from_curved_side(c, curved_pt)
+            if far_vertex is not None:
+                cx = cx + (far_vertex[0] - cx) * bias_ratio
+                cy = cy + (far_vertex[1] - cy) * bias_ratio
 
         # 가장자리 안전 margin — 안쪽으로 밀어넣기
         margin_x = int(w * edge_margin_ratio)
@@ -649,10 +705,15 @@ def _ratio_iou(a: tuple, b: tuple) -> float:
     return inter / uni if uni > 0 else 0.0
 
 
-def check_roi_group_consistency(images: list, iou_thresh: float = 0.70) -> dict:
+def check_roi_group_consistency(images: list, iou_thresh: float = 0.70,
+                                snap_to_median: bool = False) -> dict:
     """같은 cond 그룹 내 ROI 비율 일관성 점검.
 
     각 그룹의 ROI 비율 중앙값과 IoU < iou_thresh 인 이미지를 outlier 로 마킹.
+
+    snap_to_median=True 이면 outlier 의 ROI 를 그룹 중앙값 비율로 덮어씀
+    (`roi_source` 가 'db' 또는 'manual' 인 이미지는 보호).
+
     Returns dict {idx: (is_outlier: bool, group_iou: float)}
     """
     out = {}
@@ -678,7 +739,14 @@ def check_roi_group_consistency(images: list, iou_thresh: float = 0.70) -> dict:
         med = tuple(float(np.median([r[k] for r in ratios])) for k in range(4))
         for i, r in zip(idxs, ratios):
             iou = _ratio_iou(r, med)
-            out[i] = (iou < iou_thresh, iou)
+            is_out = iou < iou_thresh
+            out[i] = (is_out, iou)
+            if (snap_to_median and is_out and
+                    images[i].get("roi_source") not in ("db", "manual")):
+                h, w = images[i]["rgb"].shape[:2]
+                images[i]["roi"] = (int(med[0] * w), int(med[1] * h),
+                                    int(med[2] * w), int(med[3] * h))
+                images[i]["roi_source"] = "auto_snapped"
     return out
 
 
@@ -1342,7 +1410,11 @@ def _db_open_safe(path: str, timeout: float = 15.0) -> sqlite3.Connection:
 
 
 def db_init(path: str) -> sqlite3.Connection:
-    """DB 파일을 열고 테이블이 없으면 생성"""
+    """DB 파일을 열고 테이블이 없으면 생성.
+
+    통합 DB (v2): images + raman_data + 매칭 컬럼(images.raman_id) 한 파일에.
+    구 DB (v1): images 만 있던 경우 raman_id 컬럼 자동 ALTER.
+    """
     con = _db_open_safe(path)
     con.execute(f"""
         CREATE TABLE IF NOT EXISTS meta (
@@ -1365,8 +1437,30 @@ def db_init(path: str) -> sqlite3.Connection:
             stats_json  TEXT,
             rgb_blob    BLOB,
             thumb_blob  BLOB,
+            raman_id    INTEGER,
             saved_at    TEXT DEFAULT (datetime('now','localtime'))
         )""")
+    # 라만 데이터 테이블 — 통합 DB 의 일부. id 보존(저장→로드 매칭).
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS raman_data (
+            id           INTEGER PRIMARY KEY,
+            cond         TEXT,
+            day          TEXT,
+            peak         REAL,
+            norm_peak    REAL,
+            peak_shift   REAL,
+            peak_range   TEXT,
+            spectrum_json TEXT,
+            saved_at     TEXT DEFAULT (datetime('now','localtime'))
+        )""")
+    # v1 → v2 마이그레이션: images 에 raman_id 가 없으면 추가
+    cols = [r[1] for r in con.execute("PRAGMA table_info(images)").fetchall()]
+    if "raman_id" not in cols:
+        try:
+            con.execute("ALTER TABLE images ADD COLUMN raman_id INTEGER")
+            print("[db-init] migrated: added images.raman_id column")
+        except Exception as e:
+            print(f"[db-init] WARN ALTER images.raman_id failed: {e}")
     con.execute(f"INSERT OR IGNORE INTO meta VALUES ('version','{_DB_VERSION}')")
     con.commit()
     return con
@@ -1476,8 +1570,9 @@ def db_save_all(path: str, images: list) -> int:
              lab_L, lab_a, lab_b, delta_e,
              glcm_con, glcm_eng, glcm_hom, glcm_cor,
              stats_json, rgb_blob, thumb_blob,
+             raman_id,
              saved_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
                     datetime('now','localtime'))
         """, (
             img["name"], img["day"], img["cond"],
@@ -1492,6 +1587,7 @@ def db_save_all(path: str, images: list) -> int:
             glcm.get("homogeneity", np.nan), glcm.get("correlation", np.nan),
             _json.dumps(stats_safe, ensure_ascii=False),
             rgb_blob, thumb_blob,
+            img.get("raman_id"),
         ))
         count += 1
 
@@ -1513,7 +1609,7 @@ def db_save_all(path: str, images: list) -> int:
 
 
 def db_load_all(path: str) -> list:
-    """DB에서 전체 이미지 레코드를 dict 리스트로 반환 (rgb_blob 포함)"""
+    """DB에서 전체 이미지 레코드를 dict 리스트로 반환 (rgb_blob + raman_id 포함)"""
     con = db_init(path)
     rows = con.execute("""
         SELECT name, day, cond,
@@ -1521,7 +1617,7 @@ def db_load_all(path: str) -> list:
                s_mean, yellow_ratio, yellowness_idx,
                lab_L, lab_a, lab_b, delta_e,
                glcm_con, glcm_eng, glcm_hom, glcm_cor,
-               stats_json, rgb_blob, thumb_blob, saved_at
+               stats_json, rgb_blob, thumb_blob, raman_id, saved_at
         FROM images ORDER BY cond, CAST(day AS REAL)
     """).fetchall()
     con.close()
@@ -1533,7 +1629,7 @@ def db_load_all(path: str) -> list:
          s_mean, yr, yi,
          lab_L, lab_a, lab_b, de,
          gc, ge, gh, gcr,
-         stats_json, rgb_blob, thumb_blob, saved_at) = r
+         stats_json, rgb_blob, thumb_blob, raman_id, saved_at) = r
 
         roi = (x0,y0,x1,y1) if x0 is not None else None
         rgb = _blob_to_rgb(rgb_blob) if rgb_blob else None
@@ -1560,11 +1656,88 @@ def db_load_all(path: str) -> list:
                      "energy":      float(ge  or 0),
                      "homogeneity": float(gh  or 0),
                      "correlation": float(gcr or 0)},
+            "raman_id": int(raman_id) if raman_id is not None else None,
             "auto_parsed": False,
             "saved_at": saved_at,
             "_from_db": True,
         })
     return result
+
+
+def db_load_raman_all(path: str) -> list:
+    """통합 DB 에서 raman_data 전체 로드 (id 보존). 빈 테이블이면 [] 반환."""
+    out = []
+    try:
+        con = _db_open_safe(path)
+        try:
+            cur = con.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='raman_data'")
+            if not cur.fetchone():
+                return out
+            rows = con.execute(
+                "SELECT id, cond, day, peak, norm_peak, peak_shift, "
+                "peak_range, spectrum_json FROM raman_data ORDER BY id"
+            ).fetchall()
+            for (rid, cond, day, peak, norm_peak,
+                 peak_shift, peak_range, spec_j) in rows:
+                spec = _json.loads(spec_j) if spec_j else None
+                out.append({
+                    "_id":       int(rid),
+                    "cond":      cond or "",
+                    "day":       day  or "",
+                    "peak":      float(peak or 0),
+                    "norm_peak": float(norm_peak or 0),
+                    "peak_shift":float(peak_shift or 0),
+                    "peak_range":str(peak_range or ""),
+                    "spectrum":  spec,
+                })
+        finally:
+            con.close()
+    except Exception as e:
+        print(f"[db-load-raman] WARN: {type(e).__name__}: {e}")
+    return out
+
+
+def db_save_raman_all(con: sqlite3.Connection, raman_list: list) -> int:
+    """이미 열린 connection 에 라만 데이터 일괄 저장. id 보존(있으면 사용).
+
+    raman_list 의 각 dict 가 가진 _id (int) 가 있으면 그 id 로 INSERT,
+    없으면 자동 할당 후 dict 에 _id 채워 넣음. 매칭 보존을 위함.
+    저장 후 _id 가 새로 부여된 경우 호출자가 매칭 (img['raman_id']) 갱신 필요.
+    """
+    con.execute("DELETE FROM raman_data")
+    n = 0
+    for r in raman_list:
+        spec_j = (_json.dumps(r["spectrum"]) if r.get("spectrum") else None)
+        rid = r.get("_id")
+        if rid is not None:
+            con.execute(
+                "INSERT INTO raman_data"
+                " (id, cond, day, peak, norm_peak, peak_shift,"
+                "  peak_range, spectrum_json, saved_at)"
+                " VALUES (?,?,?,?,?,?,?,?,datetime('now','localtime'))",
+                (int(rid), r.get("cond",""), r.get("day",""),
+                 float(r.get("peak", 0)),
+                 float(r.get("norm_peak") or 0),
+                 float(r.get("peak_shift") or 0),
+                 str(r.get("peak_range","")),
+                 spec_j))
+        else:
+            cur = con.execute(
+                "INSERT INTO raman_data"
+                " (cond, day, peak, norm_peak, peak_shift,"
+                "  peak_range, spectrum_json, saved_at)"
+                " VALUES (?,?,?,?,?,?,?,datetime('now','localtime'))",
+                (r.get("cond",""), r.get("day",""),
+                 float(r.get("peak", 0)),
+                 float(r.get("norm_peak") or 0),
+                 float(r.get("peak_shift") or 0),
+                 str(r.get("peak_range","")),
+                 spec_j))
+            r["_id"] = cur.lastrowid
+        n += 1
+    return n
 
 
 # ══════════════════════════════════════════════
@@ -4950,11 +5123,29 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 except Exception as ex:
                     errors.append(f"{os.path.basename(path)} (images): {ex}")
 
-            # ── Raman 데이터 ───────────────────────────
+            # ── Raman 데이터 (id 보존 — 매칭 복원에 필수) ──
             if "raman_data" in tables:
                 try:
-                    added_r = self._db_load_raman(path)
-                    n_raman += added_r
+                    new_raman = db_load_raman_all(path)
+                    if new_raman:
+                        # 기존 _raman_data 와 _id 충돌 회피 (다른 통합 DB 합칠 때)
+                        existing_ids = set(r.get("_id")
+                                           for r in self._raman_data
+                                           if r.get("_id") is not None)
+                        max_id = max(existing_ids, default=0)
+                        for r in new_raman:
+                            rid = r.get("_id")
+                            if rid in existing_ids:
+                                # id 충돌 — 새 id 로 재할당, 매칭은 깨짐
+                                max_id += 1
+                                r["_id"] = max_id
+                                existing_ids.add(max_id)
+                            else:
+                                existing_ids.add(rid)
+                                if rid is not None:
+                                    max_id = max(max_id, rid)
+                            self._raman_data.append(r)
+                            n_raman += 1
                 except Exception as ex:
                     errors.append(f"{os.path.basename(path)} (raman): {ex}")
 
@@ -4977,6 +5168,9 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
 
         if n_raman > 0:
             self._normalize_raman()
+            # 매칭 보강: 이미 raman_id 가 복원된 이미지는 그대로,
+            # 새로 매칭 가능한 (cond+day 일치 + raman_id None) 이미지에는 자동 매칭
+            self._auto_link_raman_by_cond_day()
             self._rebuild_raman_tree()
             self._refresh_raman_tab()
 
@@ -5041,6 +5235,15 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
               f"eval_targets={len(self._pred_targets) if hasattr(self, '_pred_targets') and self._pred_targets else 0}")
 
         try:
+            # step 0: 라만 _id 미부여 항목에 id 부여 (매칭 보존)
+            #         self._raman_data 인메모리 갱신 — 다음 단계의 img.raman_id 가 정확히 참조
+            if hasattr(self, "_raman_data") and self._raman_data:
+                self._ensure_raman_ids()
+            n_raman_local = (len(self._raman_data)
+                             if hasattr(self, "_raman_data") else 0)
+            print(f"[_db_save] step 0: raman _id ensured "
+                  f"(raman_entries={n_raman_local})")
+
             print(f"[_db_save] step 1: db_save_all -> tmp")
             n = db_save_all(tmp_path, self.images)
             tmp_size_after_imgs = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else -1
@@ -5078,12 +5281,19 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                     print(f"[_db_save] step 2: inserted {n_targets} eval_targets")
                 else:
                     print(f"[_db_save] step 2: no pred_targets, skipping inserts")
+                # step 3: 라만 데이터 저장 (같은 connection)
+                if hasattr(self, "_raman_data") and self._raman_data:
+                    n_r_saved = db_save_raman_all(con, self._raman_data)
+                    print(f"[_db_save] step 3: saved {n_r_saved} raman entries")
+                else:
+                    con.execute("DELETE FROM raman_data")
+                    print(f"[_db_save] step 3: no raman entries (cleared table)")
                 con.execute("DROP TABLE IF EXISTS eval_target_v1_backup")
                 con.commit()
-                print(f"[_db_save] step 2 ok: commit done")
+                print(f"[_db_save] step 2+3 ok: commit done")
             finally:
                 con.close()
-                print(f"[_db_save] step 2: connection closed")
+                print(f"[_db_save] step 2+3: connection closed")
 
             tmp_size_final = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else -1
             print(f"[_db_save] step 3: prepare to move tmp -> dst, tmp_final_size={tmp_size_final}")
@@ -5349,7 +5559,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 else:
                     # ROI 없으면 자동 추정
                     try:
-                        roi, flag, reason = auto_detect_roi(rgb)
+                        roi, flag, reason = auto_detect_roi(rgb, cond=cond_hint)
                     except Exception:
                         h, w = rgb.shape[:2]
                         roi = (w//4, h//4, 3*w//4, 3*h//4)
@@ -5495,6 +5705,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 added += 1
             if added:
                 self._normalize_raman()
+                self._auto_link_raman_by_cond_day()
                 self._rebuild_raman_tree()
                 self._refresh_raman_tab()
             return added
@@ -6327,7 +6538,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             if t is None:
                 return
         try:
-            roi, flag, reason = auto_detect_roi(t["rgb"])
+            roi, flag, reason = auto_detect_roi(t["rgb"], cond=t.get("cond_hint"))
         except Exception:
             h, w = t["rgb"].shape[:2]
             roi = (w//4, h//4, 3*w//4, 3*h//4)
@@ -6892,9 +7103,15 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
 
         pairs = []
         for img in an:
-            r_m = next((r for r in rd
-                        if r["cond"] == img["cond"]
-                        and r["day"]  == img["day"]), None)
+            # 명시적 매칭(raman_id) 우선, 없으면 cond+day 자연 매칭 fallback
+            r_m = None
+            rid = img.get("raman_id")
+            if rid is not None:
+                r_m = self._raman_by_id(rid)
+            if r_m is None:
+                r_m = next((r for r in rd
+                            if r["cond"] == img["cond"]
+                            and r["day"]  == img["day"]), None)
             if r_m:
                 peak_val = _extract_peak(r_m)
                 pairs.append({
@@ -9596,7 +9813,14 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         except ValueError:
             messagebox.showerror(_L("오류","Error"),"피크 강도는 숫자로 입력한다.")
             return
-        self._raman_data.append({"cond":cond,"day":day,"peak":peak})
+        new_entry = {"cond":cond,"day":day,"peak":peak}
+        self._raman_data.append(new_entry)
+        self._ensure_raman_ids()
+        # 라만 추가 직후 매칭할 이미지(들) 선택
+        if self.images:
+            picked = self._pick_images_for_raman_dialog(new_entry)
+            if picked is not None and picked:
+                self._attach_raman_to_images(new_entry["_id"], picked)
         self._normalize_raman()
         self._rebuild_raman_tree()
         self._raman_cond_var.set(""); self._raman_day_var.set("")
@@ -9608,11 +9832,217 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         if not sel: return
         for item in sel:
             vals = self._raman_tree.item(item,"values")
+            # 삭제 대상 _id 모아서 매칭 일괄 해제
+            doomed_ids = [r.get("_id") for r in self._raman_data
+                          if r["cond"] == vals[0] and r["day"] == str(vals[1])
+                          and r.get("_id") is not None]
+            for rid in doomed_ids:
+                self._detach_raman_from_all(rid)
             self._raman_data = [
                 r for r in self._raman_data
                 if not (r["cond"]==vals[0] and r["day"]==str(vals[1]))]
         self._normalize_raman()
         self._rebuild_raman_tree()
+
+    def _auto_link_raman_by_cond_day(self, raman_entries=None):
+        """주어진 라만 entry 들을 cond+day 동일 이미지에 자동 매칭.
+
+        raman_entries=None 이면 전체. 이미 raman_id 가 있는 이미지는 덮지 않음.
+        반환: 새로 매칭된 (image_idx, raman_id) 쌍 수.
+        """
+        if raman_entries is None:
+            raman_entries = self._raman_data
+        self._ensure_raman_ids()
+        n_linked = 0
+        for r in raman_entries:
+            rid = r.get("_id")
+            if rid is None:
+                continue
+            rcond = (r.get("cond") or "").strip()
+            rday = str(r.get("day") or "").strip()
+            for i, img in enumerate(self.images):
+                if img.get("raman_id") is not None:
+                    continue
+                if (img.get("cond") == rcond and
+                        str(img.get("day", "")) == rday):
+                    img["raman_id"] = rid
+                    self._refresh_card_raman_badge(i)
+                    n_linked += 1
+        return n_linked
+
+    def _ensure_raman_ids(self):
+        """self._raman_data 의 각 entry 에 _id 가 없으면 새로 부여 (1부터, 충돌 회피).
+
+        통합 DB 저장 시 호출됨 — img['raman_id'] 가 가리킬 안정적 id 보장.
+        """
+        used = {r["_id"] for r in self._raman_data
+                if r.get("_id") is not None}
+        next_id = max(used, default=0) + 1
+        for r in self._raman_data:
+            if r.get("_id") is None:
+                while next_id in used:
+                    next_id += 1
+                r["_id"] = next_id
+                used.add(next_id)
+                next_id += 1
+
+    def _raman_by_id(self, rid):
+        """raman _id → entry. 없으면 None."""
+        if rid is None:
+            return None
+        for r in self._raman_data:
+            if r.get("_id") == rid:
+                return r
+        return None
+
+    def _images_with_raman(self, rid):
+        """라만 _id 에 매칭된 이미지 인덱스 리스트."""
+        return [i for i, img in enumerate(self.images)
+                if img.get("raman_id") == rid]
+
+    def _detach_raman_from_all(self, rid):
+        """라만 _id 매칭을 모든 이미지에서 해제. 카드 뱃지 갱신."""
+        if rid is None:
+            return
+        for i, img in enumerate(self.images):
+            if img.get("raman_id") == rid:
+                img["raman_id"] = None
+                self._refresh_card_raman_badge(i)
+
+    def _attach_raman_to_images(self, rid, idx_list):
+        """라만 _id 를 이미지 idx 들에 매칭 (기존 매칭 유지). 카드 뱃지 갱신."""
+        if rid is None:
+            return
+        for i in idx_list:
+            if 0 <= i < len(self.images):
+                self.images[i]["raman_id"] = rid
+                self._refresh_card_raman_badge(i)
+
+    def _pick_images_for_raman_dialog(self, raman_entry,
+                                      preselect_same_cond_day=True):
+        """라만 entry 에 매칭할 이미지(들)를 사용자가 선택하는 모달 다이얼로그.
+
+        Returns: 선택된 이미지 idx 리스트 (취소 시 None).
+        """
+        if not self.images:
+            messagebox.showinfo(
+                _L("이미지 없음", "No images"),
+                _L("먼저 이미지를 추가하세요.", "Add images first."))
+            return None
+        win = tk.Toplevel(self)
+        win.title(_L("라만 매칭 이미지 선택",
+                     "Pick images to link with Raman"))
+        win.transient(self)
+        win.grab_set()
+        win.geometry("520x460")
+
+        rcond = (raman_entry.get("cond") or "").strip()
+        rday = str(raman_entry.get("day") or "").strip()
+        peak = raman_entry.get("peak")
+        tk.Label(
+            win, anchor="w",
+            text=(f"Raman:  cond={rcond}  day={rday}  peak={peak}"),
+            font=("Segoe UI", 9, "bold")
+        ).pack(fill="x", padx=8, pady=(8, 4))
+
+        # 체크박스 Treeview
+        from tkinter import ttk as _ttk
+        tree = _ttk.Treeview(
+            win, columns=("name", "cond", "day", "match"),
+            show="headings", height=14, selectmode="extended")
+        for col, label, w in (("name", "name", 220),
+                              ("cond", "cond", 130),
+                              ("day", "day", 50),
+                              ("match", "current raman", 90)):
+            tree.heading(col, text=label)
+            tree.column(col, width=w, anchor="w")
+        tree.pack(fill="both", expand=True, padx=8, pady=4)
+
+        # 행 채우기 + 같은 cond+day 사전 선택
+        for i, img in enumerate(self.images):
+            cur_rid = img.get("raman_id")
+            cur_label = (f"#{cur_rid}" if cur_rid is not None
+                         else "")
+            tree.insert("", "end", iid=str(i),
+                        values=(img.get("name", ""),
+                                img.get("cond", ""),
+                                img.get("day", ""),
+                                cur_label))
+            if preselect_same_cond_day:
+                if (img.get("cond") == rcond and
+                        str(img.get("day", "")) == rday):
+                    tree.selection_add(str(i))
+
+        # 버튼 행
+        btn_row = tk.Frame(win)
+        btn_row.pack(fill="x", padx=8, pady=6)
+
+        def _select_all():
+            tree.selection_set([str(i) for i in range(len(self.images))])
+
+        def _select_same_cond():
+            tree.selection_set([str(i) for i, img in enumerate(self.images)
+                                if img.get("cond") == rcond])
+
+        def _clear():
+            tree.selection_remove(tree.selection())
+
+        tk.Button(btn_row, text=_L("전체", "All"),
+                  command=_select_all).pack(side="left", padx=2)
+        tk.Button(btn_row, text=_L("동일 cond", "Same cond"),
+                  command=_select_same_cond).pack(side="left", padx=2)
+        tk.Button(btn_row, text=_L("해제", "Clear"),
+                  command=_clear).pack(side="left", padx=2)
+
+        result = {"idx": None}
+
+        def _ok():
+            result["idx"] = [int(i) for i in tree.selection()]
+            win.destroy()
+
+        def _skip():
+            result["idx"] = []
+            win.destroy()
+
+        def _cancel():
+            result["idx"] = None
+            win.destroy()
+
+        tk.Button(btn_row, text=_L("취소", "Cancel"),
+                  command=_cancel).pack(side="right", padx=2)
+        tk.Button(btn_row, text=_L("매칭 안 함", "Skip"),
+                  command=_skip).pack(side="right", padx=2)
+        tk.Button(btn_row, text=_L("확인", "OK"),
+                  command=_ok, bg="#4f46e5", fg="white"
+                  ).pack(side="right", padx=2)
+
+        win.wait_window()
+        return result["idx"]
+
+    def _refresh_card_raman_badge(self, idx):
+        """단일 카드의 라만 매칭 뱃지(⚛) 갱신. 캐시된 카드 frame 의 라벨을 토글."""
+        if not hasattr(self, "_cards_by_idx"):
+            return
+        card = self._cards_by_idx.get(idx)
+        if card is None:
+            return
+        # 기존 뱃지 제거
+        for w in card.winfo_children():
+            if getattr(w, "_is_raman_badge", False):
+                try: w.destroy()
+                except Exception: pass
+        # 매칭 있으면 새로 추가
+        img = self.images[idx] if 0 <= idx < len(self.images) else None
+        if img is None or img.get("raman_id") is None:
+            return
+        try:
+            lbl = tk.Label(card, text="⚛", fg="#a78bfa",
+                           bg=card.cget("bg"),
+                           font=("Segoe UI", 11, "bold"))
+            lbl._is_raman_badge = True
+            lbl.place(relx=1.0, rely=0.0, anchor="ne", x=-6, y=2)
+        except Exception as e:
+            print(f"[raman-badge] WARN idx={idx}: {e}")
 
     def _normalize_raman(self):
         """조건별로 첫날 피크를 1.0으로 정규화"""
@@ -9925,14 +10355,16 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                     _L(f"✓ 임포트됨","✓ Imported"))
 
             self._normalize_raman()
+            # 추가된 라만 항목들을 cond+day 일치 이미지에 자동 매칭
+            n_link = self._auto_link_raman_by_cond_day()
             self._rebuild_raman_tree()
             self._refresh_raman_tab()
             total_var.set(
-                _L(f"✓ 총 {total_added}개 피크 임포트 완료",
-                   f"✓ {total_added} peaks imported total"))
+                _L(f"✓ 총 {total_added}개 피크 임포트 완료 (이미지 매칭 {n_link}건)",
+                   f"✓ {total_added} peaks imported total ({n_link} image links)"))
             self._set_status(
-                _L(f"✓ Raman 일괄 로드 완료 ({total_added}개)",
-                   f"✓ Raman batch load complete ({total_added})"))
+                _L(f"✓ Raman 일괄 로드 완료 ({total_added}개, 매칭 {n_link})",
+                   f"✓ Raman batch load complete ({total_added}, links {n_link})"))
 
         tk.Button(btn_f,
                   text=_L("✔ 선택 파일 일괄 임포트","✔ Import Selected Files"),
@@ -10411,12 +10843,13 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                     added += 1
 
             self._normalize_raman()
+            n_link = self._auto_link_raman_by_cond_day()
             self._rebuild_raman_tree()
             self._refresh_raman_tab()
-            status_var.set(_L(f"✓ {added}개 피크 임포트 완료",
-                               f"✓ {added} peaks imported"))
-            self._set_status(_L(f"✓ Raman 스마트 로드 완료 ({added}개)",
-                                 f"✓ Raman smart load complete ({added})"))
+            status_var.set(_L(f"✓ {added}개 피크 임포트 (이미지 매칭 {n_link}건)",
+                               f"✓ {added} peaks imported ({n_link} image links)"))
+            self._set_status(_L(f"✓ Raman 스마트 로드 완료 ({added}개, 매칭 {n_link})",
+                                 f"✓ Raman smart load complete ({added}, links {n_link})"))
 
         tk.Button(btn_f,
                   text=_L("✔ 임포트","✔ Import"),
@@ -10457,12 +10890,17 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
 
         def _safe(v): return 0.0 if v is None or np.isnan(float(v)) else float(v)
 
-        # cond+day 기준 매칭
+        # 명시적 매칭(raman_id) 우선, 없으면 cond+day 자연 매칭
         pairs = []
         for img in an:
-            r_match = next((r for r in rd
-                            if r["cond"] == img["cond"]
-                            and r["day"] == img["day"]), None)
+            r_match = None
+            rid = img.get("raman_id")
+            if rid is not None:
+                r_match = self._raman_by_id(rid)
+            if r_match is None:
+                r_match = next((r for r in rd
+                                if r["cond"] == img["cond"]
+                                and r["day"] == img["day"]), None)
             if r_match:
                 pairs.append({
                     "cond": img["cond"], "day": img["day"],
@@ -10855,8 +11293,9 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                     continue
 
             self._normalize_raman()
+            n_link = self._auto_link_raman_by_cond_day()
             self._rebuild_raman_tree()
-            self._set_status(_L(f"✓ Raman 데이터 {added}행 로드 완료: {os.path.basename(path)}",f"✓ Raman data loaded: {added} rows  ({os.path.basename(path)})"))
+            self._set_status(_L(f"✓ Raman 데이터 {added}행 로드 (매칭 {n_link}건): {os.path.basename(path)}",f"✓ Raman data loaded: {added} rows, {n_link} links  ({os.path.basename(path)})"))
 
         except Exception as ex:
             messagebox.showerror(_L("로드 오류","Load Error"), str(ex))
@@ -12000,6 +12439,13 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             # 일관성 점검 결과 카드에 보존 (ROI 라벨에서 사용)
             img["_roi_inconsistent"] = inconsistent
             img["_roi_group_iou"] = group_iou
+            # 라만 매칭 ⚛ 뱃지 (있으면 우상단)
+            if img.get("raman_id") is not None:
+                badge = tk.Label(card, text="⚛", fg="#a78bfa",
+                                 bg=card["bg"],
+                                 font=("Segoe UI", 11, "bold"))
+                badge._is_raman_badge = True
+                badge.place(relx=1.0, rely=0.0, anchor="ne", x=-6, y=2)
 
             # 썸네일 + 필드
             top = tk.Frame(card, bg=card["bg"])
@@ -13790,7 +14236,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         auto_day, auto_cond = parse_filename_tags(name)
         auto_parsed = bool(auto_day or auto_cond)
         # 자동 ROI 추정 — paper 분리 + bounding box + 품질 플래그
-        auto_roi, roi_flag, roi_reason = auto_detect_roi(rgb)
+        auto_roi, roi_flag, roi_reason = auto_detect_roi(rgb, cond=auto_cond)
         entry = {
             "name":name, "rgb":rgb,
             "hsi":(H_ch,S_ch,I_ch),
@@ -14005,7 +14451,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                     "warn_paper": 0, "failed": 0}
         for i in targets:
             img = self.images[i]
-            new_roi, new_flag, new_reason = auto_detect_roi(img["rgb"])
+            new_roi, new_flag, new_reason = auto_detect_roi(
+                img["rgb"], cond=img.get("cond"))
             img["roi"] = new_roi
             img["mask"] = roi_to_mask(img["rgb"].shape, new_roi)
             img["roi_flag"] = new_flag
