@@ -13590,7 +13590,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                      and not np.isnan(img.get("glcm",{}).get("contrast",np.nan))],
                     key=lambda x:df(x[0]))
                 if pts:
-                    xs,ys=zip(*pts)
+                    xs=[df(p[0]) for p in pts]
+                    ys=[p[1]      for p in pts]
                     ax.plot(xs,ys,"D-",color=col,lw=lw,ms=ms,label=cond)
             ax.legend(fontsize=fs_k,framealpha=0.8,edgecolor=BORDER)
             fig.tight_layout(pad=1.2)
@@ -13622,11 +13623,13 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                      and not np.isnan(img.get("glcm",{}).get("homogeneity",np.nan))],
                     key=lambda x:df(x[0]))
                 if pts_e:
-                    xs,ys=zip(*pts_e)
+                    xs=[df(p[0]) for p in pts_e]
+                    ys=[p[1]      for p in pts_e]
                     ax.plot(xs,ys,"o-",color=col,lw=lw,ms=ms,
                             label=f"{cond} E")
                 if pts_h:
-                    xs,ys=zip(*pts_h)
+                    xs=[df(p[0]) for p in pts_h]
+                    ys=[p[1]      for p in pts_h]
                     ax2.plot(xs,ys,"s--",color=col,lw=lw,ms=ms,
                              alpha=0.7,label=f"{cond} H")
             lines1,lab1=ax.get_legend_handles_labels()
@@ -13664,7 +13667,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                                key=lambda x:df(x["day"]))
                 if not imgs_c: continue
                 col=COND_COLORS[ci%len(COND_COLORS)]
-                days_c=[i["day"] for i in imgs_c]
+                days_c=[df(i["day"]) for i in imgs_c]
 
                 # b* 정규화
                 b_vals=[i["lab"]["b"] for i in imgs_c]
@@ -15526,7 +15529,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                         pts.append((img["day"],float(np.mean(H_ch[msk]))))
                 pts.sort(key=lambda x:df(x[0]))
                 if pts:
-                    xs,ys=zip(*pts)
+                    xs=[df(p[0]) for p in pts]
+                    ys=[p[1]      for p in pts]
                     ax.plot(xs,ys,"^-",color=col,lw=lw,ms=ms,label=cond)
                     for x,y in zip(xs,ys):
                         ax.annotate(f"{y:.1f}",(x,y),
