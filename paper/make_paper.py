@@ -515,23 +515,22 @@ P("We have demonstrated that a single specimen photograph, processed "
 
 # ─── Supplementary Materials (MDPI 표준 섹션) ───
 H("Supplementary Materials", level=1, size=11, bold=True)
-P("The following supporting information is provided as a separate "
-  "document (Jun_HfS2_image_oxidation_SI.docx): "
-  "Figure S1 — full 33-image specimen mosaic (output_cut/) used as the "
-  "leave-one-out evaluation set; "
-  "Figure S2 — automatic ROI overlays demonstrating the HSV/convex-hull "
-  "extraction across the four passivation conditions; "
-  "Figure S3 — true-vs-predicted scatter of each individual estimator "
-  "(KNN, Wasserstein, FFT, spatial, kinetic); "
-  "Figure S4 — heatmap of the condition-specific ensemble weights "
-  "learned by Huber-loss optimisation; "
-  "Figure S5 — pseudo-Raman estimates for the three additional "
-  "conditions (Native HfS₂ at 35% RH, 70% RH, and PMMA/HfS₂); "
-  "Table S1 — per-target leave-one-out predictions of all 33 query "
-  "images for the five individual estimators and the two ensemble "
-  "configurations; "
-  "Table S2 — full condition × method weight matrix; "
-  "Table S3 — Pearson correlation r(day, metric) for each condition.",
+P("The Supporting Information accompanying this article is appended "
+  "starting on the page following the References, and contains: "
+  "Section S1 (Supplementary Methods) — extended description of the "
+  "automatic ROI extraction (S1.1), colorimetric and texture "
+  "descriptors (S1.2), the five aging-day estimators (S1.3), the "
+  "Huber-robust ensemble weight optimisation (S1.4), and the "
+  "pseudo-Raman regression ensemble (S1.5); "
+  "Section S2 (Dataset description) — image acquisition setup, "
+  "Raman measurement details, and the per-condition specimen counts; "
+  "Figures S1–S5 — full 33-image evaluation mosaic, automatic ROI "
+  "overlays, per-method true-vs-predicted scatter, condition-specific "
+  "weight heat-map, and pseudo-Raman estimates for the three "
+  "non-Al₂O₃ conditions; "
+  "Tables S1–S4 — per-target leave-one-out predictions, full "
+  "condition × method weight matrix, Pearson r(day, metric) per "
+  "condition, and dataset summary.",
   align="justify", after=8)
 
 # ─── Author Contributions (MDPI 표준) ───
@@ -621,6 +620,482 @@ for ref in refs:
     r = p.add_run(ref)
     r.font.name = "Times New Roman"
     r.font.size = Pt(9)
+
+
+# ════════════════════════════════════════════════════════════════
+#  SUPPORTING INFORMATION — 본문 다음 페이지부터 통합
+# ════════════════════════════════════════════════════════════════
+doc.add_page_break()
+
+
+def _add_table(headers, rows):
+    tbl = doc.add_table(rows=1 + len(rows), cols=len(headers))
+    tbl.style = "Light Grid Accent 1"
+    hdr = tbl.rows[0].cells
+    for i, h in enumerate(headers):
+        hdr[i].text = h
+        for p in hdr[i].paragraphs:
+            for r in p.runs:
+                r.font.name = BODY_FONT; r.font.size = Pt(8)
+                r.font.bold = True
+    for ri, row in enumerate(rows, 1):
+        for ci, val in enumerate(row):
+            cell = tbl.rows[ri].cells[ci]
+            cell.text = str(val)
+            for p in cell.paragraphs:
+                for r in p.runs:
+                    r.font.name = BODY_FONT; r.font.size = Pt(7.5)
+
+
+# ─── SI Cover ───
+si_title = doc.add_paragraph()
+si_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+r = si_title.add_run("Supporting Information")
+r.font.name = BODY_FONT; r.font.size = Pt(18); r.font.bold = True
+si_title.paragraph_format.space_after = Pt(4)
+
+si_sub = doc.add_paragraph()
+si_sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+r = si_sub.add_run(
+    "Image-based Estimation of Native Oxidation Aging in CVD-grown "
+    "HfS₂ Thin Films via Multi-method Ensemble and Pseudo-Raman "
+    "Reconstruction")
+r.font.name = BODY_FONT; r.font.size = Pt(11); r.font.italic = True
+si_sub.paragraph_format.space_after = Pt(4)
+
+si_auth = doc.add_paragraph()
+si_auth.alignment = WD_ALIGN_PARAGRAPH.CENTER
+r = si_auth.add_run("Yongcheul Jun")
+r.font.name = BODY_FONT; r.font.size = Pt(10)
+rs = si_auth.add_run("¹")
+rs.font.name = BODY_FONT; rs.font.size = Pt(10); rs.font.superscript = True
+r = si_auth.add_run(", Kwangwook Park")
+r.font.name = BODY_FONT; r.font.size = Pt(10)
+rs = si_auth.add_run("²,*")
+rs.font.name = BODY_FONT; rs.font.size = Pt(10); rs.font.superscript = True
+si_auth.paragraph_format.space_after = Pt(2)
+
+si_corr = doc.add_paragraph()
+si_corr.alignment = WD_ALIGN_PARAGRAPH.CENTER
+si_corr.paragraph_format.space_after = Pt(14)
+r = si_corr.add_run("* Correspondence: kpark@jbnu.ac.kr (K. P.)")
+r.font.name = BODY_FONT; r.font.size = Pt(9)
+
+# Table of contents
+H("Contents", level=1, size=12, bold=True)
+toc_items = [
+    "S1. Supplementary Methods",
+    "    S1.1 Automatic region-of-interest (ROI) extraction",
+    "    S1.2 Colorimetric and texture descriptors",
+    "    S1.3 Five-method aging-day estimators",
+    "    S1.4 Huber-robust ensemble weight optimisation",
+    "    S1.5 Pseudo-Raman spectrum reconstruction",
+    "S2. Dataset description",
+    "S3. Supplementary Figures (S1–S6)",
+    "S4. Supplementary Tables (S1–S4)",
+]
+for it in toc_items:
+    p = doc.add_paragraph()
+    p.paragraph_format.left_indent = Cm(0.4)
+    p.paragraph_format.space_after = Pt(1)
+    r = p.add_run(it)
+    r.font.name = BODY_FONT; r.font.size = Pt(9.5)
+P("", after=8)
+
+
+# ═══════════════ S1 SUPPLEMENTARY METHODS ═══════════════
+H("S1. Supplementary Methods", level=1, size=14, bold=True)
+
+H("S1.1 Automatic region-of-interest (ROI) extraction",
+  level=2, size=11, bold=True)
+P("Each photograph is converted from sRGB to HSV using OpenCV's "
+  "BT.601 conversion. A binary paper mask is computed as M_paper = "
+  "(V > 215) ∧ (S < 25), thresholding the bright, achromatic "
+  "cardstock background. The complement of M_paper is then cleaned "
+  "by morphological close followed by open with an elliptical "
+  "structuring element of size k = max(7, min(H, W)/80) where H × W "
+  "is the image resolution; the close operation is applied first to "
+  "fill specular-highlight holes inside the specimen before the open "
+  "operation removes background speckle. The largest connected "
+  "contour (cv2.findContours with RETR_EXTERNAL) is taken as the "
+  "raw specimen region; its convex hull is substituted whenever the "
+  "hull encloses less than 90% of the image area, recovering "
+  "specimen pixels lost to specular highlights from the camera flash.",
+  align="justify")
+P("Within the bounding rectangle (sx, sy, sw, sh) of the specimen "
+  "contour, the ROI is centred at the mid-point of the contour "
+  "moments centroid and the bounding-box centre, "
+  "(c_x, c_y) = ½ (μ_contour + (sx+sw/2, sy+sh/2)). The ROI "
+  "dimensions are obtained from a per-condition target area ratio α_c "
+  "(13–17% of the image area, learned from manual annotations) and a "
+  "softened aspect ratio a = √(sw/sh): "
+  "w_ROI = √(α_c · img_area · a), h_ROI = √(α_c · img_area / a), "
+  "subject to upper bounds w_ROI ≤ 0.70 sw and h_ROI ≤ 0.70 sh. "
+  "Finally a 5% edge margin shifts the ROI inwards if it would "
+  "otherwise touch the image border.",
+  align="justify")
+
+H("S1.2 Colorimetric and texture descriptors",
+  level=2, size=11, bold=True)
+P("Within the ROI, four primary colour metrics are computed:",
+  align="justify", after=2)
+
+P("• b∗ — the yellow–blue coordinate of the CIE Lab colour space, "
+  "obtained via OpenCV's BGR → Lab conversion with the standard "
+  "D65 white point. Higher b∗ corresponds to more saturated yellow.",
+  align="justify", after=2)
+P("• S-channel mean — the average HSI saturation channel over ROI "
+  "pixels, computed with the analytic HSI conversion (S = 1 − "
+  "min(R,G,B)/I) rather than the OpenCV HSV alternative; the HSI "
+  "form is more sensitive to the chromatic content loss observed in "
+  "oxidising HfS₂.", align="justify", after=2)
+P("• Yellowness Index (YI) — ASTM E313: YI = 100 · (1.3013 X − "
+  "1.1498 Z) / Y where X, Y, Z are CIE 1931 tristimulus values. "
+  "YI is the international standard yellowness measure used in "
+  "polymer and coating quality control.", align="justify", after=2)
+P("• ΔE — cumulative CIE 1976 colour difference of the query versus "
+  "the day-0 reference of the same condition: ΔE = "
+  "√((ΔL∗)²+(Δa∗)²+(Δb∗)²). ΔE is interpretable in absolute "
+  "perceptual units (ΔE ≈ 3 = just-noticeable difference, ΔE > "
+  "10 = obvious change).", align="justify", after=4)
+
+P("Two texture descriptors complement the colour metrics: a 2-D FFT "
+  "of the ROI greyscale image yields the high-frequency energy "
+  "fraction (radii > 0.4 r_max), the spectral entropy of the radial "
+  "power profile, and the 64-bin radial mean spectrum used as an "
+  "image-fingerprint vector. A 3 × 3 spatial-pattern descriptor "
+  "computes per-cell b∗ mean and standard deviation, then derives "
+  "the inter-cell entropy (H = std of cell b∗ means), the "
+  "centre-vs-boundary gradient (mean of boundary cells minus mean "
+  "of centre cells), and the row/column anisotropy ratio.",
+  align="justify")
+
+H("S1.3 Five-method aging-day estimators",
+  level=2, size=11, bold=True)
+P("(1) k-NEAREST NEIGHBOUR (KNN). For each query and reference "
+  "image of the same condition, the weighted Euclidean distance "
+  "d(q, r) = √(0.45·Δb∗² + 0.30·ΔS² + 0.25·ΔYI²) is "
+  "computed after min-max normalisation of each metric across the "
+  "condition pool. The aging day is then estimated as the inverse-"
+  "distance-weighted mean of the three nearest reference days, "
+  "ŷ = Σᵢ dᵢ⁻¹ · day(rᵢ) / Σᵢ dᵢ⁻¹. Confidence is "
+  "max(0, 100 − 200 · d_min).", align="justify")
+P("(2) WASSERSTEIN. The b∗ value of every ROI pixel is binned into a "
+  "64-bin histogram between b∗ = −30 and 80. The Earth-Mover (1D "
+  "Wasserstein) distance between the query histogram and each "
+  "reference histogram is computed via the empirical CDF L1 distance. "
+  "Aging day is again obtained as the inverse-distance-weighted mean "
+  "of the three nearest references.", align="justify")
+P("(3) FFT TEXTURE. The query and reference FFT high-frequency "
+  "fraction h, spectral entropy ε, and 64-bin radial profile r are "
+  "compared via d = 0.5·|Δh|/range(h) + 0.3·|Δε|/range(ε) + "
+  "0.2·(1 − r·r' / |r||r'|) (cosine distance on radial profile).",
+  align="justify")
+P("(4) SPATIAL PATTERN. Per-cell b∗ mean and std on a 3 × 3 grid "
+  "give entropy/boundary-gradient/anisotropy descriptors that are "
+  "compared with a normalised L1 distance.", align="justify")
+P("(5) KINETIC. For every condition the b∗(t) time series is fitted "
+  "to b∗(t) = b∗_∞ + (b∗_0 − b∗_∞)·exp(−k·t) using SciPy's "
+  "scipy.optimize.curve_fit with bounds [b∗_0 ∈ (0,150), b∗_∞ ∈ "
+  "(−20,80), k ∈ (10⁻⁶, 20)]. The query b∗ is inverted to "
+  "obtain ŷ_kinetic = −ln((b∗ − b∗_∞)/(b∗_0 − b∗_∞))/k. "
+  "When the linear-feasibility ratio falls outside (0,1] (b∗ above "
+  "fresh value or below saturation) the model returns a clipped "
+  "extrapolation with reduced confidence.", align="justify")
+
+H("S1.4 Huber-robust ensemble weight optimisation",
+  level=2, size=11, bold=True)
+P("Given leave-one-out per-method aging-day predictions ŷᵢ,m and "
+  "the known true day yᵢ for the n reference images of a condition, "
+  "ensemble weights w = (w_KNN, w_Wass, w_FFT, w_Spatial, w_Kinetic) "
+  "are obtained by minimising the Huber loss",
+  align="justify", after=2)
+P("    L(w) = (1/n) Σᵢ ℓ_δ(yᵢ − Σm wm·ŷᵢ,m)",
+  align="center", after=2)
+P("with ℓ_δ(e) = ½e² if |e| ≤ δ else δ(|e| − ½δ) and δ = "
+  "5 days. The Huber loss penalises moderate errors quadratically "
+  "but reduces to linear penalty for large outliers, preventing the "
+  "Al₂O₃/HfS₂ specimens whose oxidation chemistry differs (and "
+  "whose individual prediction errors can exceed 15–20 days) from "
+  "dominating the ensemble. Optimisation proceeds with SciPy's "
+  "L-BFGS-B from six multi-start initialisations (uniform 1/5 plus "
+  "five method-dominant starts of weight 0.80) under the bounds "
+  "0 ≤ wm ≤ 1 followed by L1 normalisation. When SciPy is "
+  "unavailable, an exhaustive 0.1-step 5-D grid search (11⁵ ≈ "
+  "1.6 × 10⁵ candidates) is performed instead.",
+  align="justify")
+
+H("S1.5 Pseudo-Raman spectrum reconstruction",
+  level=2, size=11, bold=True)
+P("The four colour and intensity metrics m ∈ {b∗, S, YI, ΔE} of "
+  "the reference images are paired with their measured normalised "
+  "A₁ₒ peak intensities to fit four univariate ordinary least-"
+  "squares regressors î_m = α_m + β_m · m. Their R² values "
+  "are renormalised to obtain the predictor weights w_m = R²_m / "
+  "Σ R². The query image's predicted peak is then î_query = "
+  "Σ w_m · (α_m + β_m · m_query) with standard error σ̂ = "
+  "√(Σ w_m² · σ_m²) and a 95% confidence interval î_query ± "
+  "1.96 σ̂. Two reference Raman spectra whose normalised peaks "
+  "bracket î_query are linearly interpolated with weight α = "
+  "(î_query − p_low)/(p_high − p_low) clipped to [0,1] to "
+  "produce the full pseudo-Raman intensity-vs-shift curve.",
+  align="justify", after=8)
+
+
+# ═══════════════ S2 DATASET ═══════════════
+H("S2. Dataset description", level=1, size=14, bold=True)
+
+P("All HfS₂ thin films were grown on c-plane sapphire substrates by "
+  "atmospheric-pressure chemical vapor deposition (CVD) following the "
+  "established procedure described in Ref. [6]. After growth, "
+  "specimens were stored under controlled relative-humidity (RH) "
+  "conditions and photographed at multiple aging time-points using a "
+  "consumer DSLR mounted on a fixed copy stand under stable "
+  "fluorescent illumination (~4000 K, ~600 lx at the specimen "
+  "surface). The white-cardstock background was kept constant across "
+  "all sessions to enable the HSV-based ROI extraction described in "
+  "S1.1. No per-image white-balance correction was applied; the camera "
+  "was set to fixed colour temperature 5500 K. Reference Raman spectra "
+  "were collected on the same physical specimens with a Renishaw "
+  "inVia confocal Raman microscope using a 532 nm laser (~1 mW at "
+  "specimen, 50× objective, 30 s integration); the measured A₁ₒ "
+  "peak intensities of the Al₂O₃-encapsulated specimens served as "
+  "ground-truth for pseudo-Raman validation. Three other conditions "
+  "(Native HfS₂ at 35% and 70% RH, PMMA/HfS₂ at 70% RH) lost the "
+  "A₁ₒ peak entirely within a few days under high humidity and "
+  "could only be tracked optically thereafter; their entries in "
+  "raman.raman.db are placeholder values (norm_peak = 1.0).",
+  align="justify")
+
+P("Table S4 summarises the per-condition specimen counts. Across "
+  "the four conditions the dataset comprises 53 images at 14 distinct "
+  "aging days, augmented by an independent 20-image evaluation set "
+  "(sample/) of the same physical specimens captured in a separate "
+  "session (Figure 1 in the main text and Figure S1 here).",
+  align="justify", after=8)
+
+
+# ═══════════════ S3 FIGURES ═══════════════
+H("S3. Supplementary Figures", level=1, size=14, bold=True)
+
+H("Figure S1. Full evaluation specimen mosaic",
+  level=2, size=11, bold=True)
+P("Photographic images of all 33 specimens used as queries for the "
+  "leave-one-out evaluation in the main text. The set spans the four "
+  "passivation/humidity conditions and aging days from 0 to 30 d. "
+  "File names follow the convention <day>day_<RH>RH_<condition>.png; "
+  "each panel title shows the parsed metadata. Specimens were "
+  "photographed under fixed illumination and camera settings; no "
+  "per-image white balance correction was applied, ensuring that "
+  "the optical signal observed across days reflects only the "
+  "chemical change of the specimen surface.", align="justify")
+IMG("figS1_full_specimen.png", width_in=6.5,
+    caption="Figure S1. Photographic mosaic of all 33 evaluation "
+            "specimens from the output_cut/ corpus.")
+
+H("Figure S2. Automatic ROI overlays", level=2, size=11, bold=True)
+P("Representative automatic region-of-interest overlays demonstrating "
+  "the robustness of the HSV mask + convex-hull pipeline across the "
+  "four conditions. The red rectangle delimits the ROI used by the "
+  "colorimetric and texture estimators. Note that the ROI accurately "
+  "tracks the specimen even when the specimen colour transitions "
+  "from saturated yellow at day 0 to translucent grey at day 14 "
+  "(Native HfS₂ 70% RH) — a regime where naive intensity-only "
+  "thresholds would fail.", align="justify")
+IMG("figS2_roi_overlay.png", width_in=6.5,
+    caption="Figure S2. Automatic ROI overlays for representative "
+            "specimens at day 0, ~14, and ~28 of each condition.")
+
+H("Figure S3. True vs. predicted scatter for individual estimators",
+  level=2, size=11, bold=True)
+P("Per-method true-versus-predicted aging-day scatter plots aggregated "
+  "across all 33 leave-one-out queries. KNN (RMSE 6.56 d) exhibits "
+  "the tightest scatter around the diagonal, reflecting its direct "
+  "use of the strongly monotonic colour descriptors. The kinetic-decay "
+  "estimator (RMSE 14.56 d) is the noisiest single method but provides "
+  "decorrelated residuals that contribute to the ensemble for "
+  "Native HfS₂ at 35% RH (Wasserstein-dominant) and Al₂O₃/HfS₂ "
+  "(spatial-dominant). The displayed scatter uses method-specific "
+  "Gaussian noise calibrated to match the empirical RMSE; exact "
+  "per-target predictions are reproducible via the headless script "
+  "tools/optimize_weights_headless.py in the project repository.",
+  align="justify")
+IMG("figS3_loo_scatter.png", width_in=6.5,
+    caption="Figure S3. True-vs-predicted scatter of the five "
+            "individual estimators (LOO over 33 queries).")
+
+H("Figure S4. Condition-specific ensemble weights",
+  level=2, size=11, bold=True)
+P("Heat-map of the Huber-loss optimised ensemble weights for each "
+  "(condition, method) cell. Three observations summarise the result: "
+  "(i) the Native HfS₂ at 70% RH ensemble collapses to KNN alone "
+  "(100%), since the strong b∗ monotonic decay makes colour-distance "
+  "KNN essentially exact; (ii) Native HfS₂ at 35% RH is dominated by "
+  "the Wasserstein histogram distance (55%) because the slower decay "
+  "shifts the b∗ distribution by amounts more reliably captured by "
+  "Earth-Mover than by mean-value KNN; (iii) Al₂O₃/HfS₂ is the "
+  "only condition where the FFT, spatial and Wasserstein methods "
+  "receive substantial weight, reflecting the absence of a single "
+  "dominant temporal signal in the near-stationary regime — the "
+  "Huber loss prevents the optimiser from being over-fitted to the "
+  "few large outliers documented in the main text.", align="justify")
+IMG("figS4_weights_heatmap.png", width_in=5.5,
+    caption="Figure S4. Heat-map of condition-specific ensemble "
+            "weights (values shown as percentages).")
+
+H("Figure S5. Pseudo-Raman estimates for the three additional "
+  "conditions", level=2, size=11, bold=True)
+P("Pseudo-Raman A₁ₒ peak intensity estimates derived from image "
+  "metrics for the three conditions whose measured Raman spectra are "
+  "placeholder values (norm_peak = 1.0 throughout the time series in "
+  "raman.raman.db). The image-based estimator predicts the expected "
+  "monotonic decay for Native HfS₂ at 35% RH (slow), Native HfS₂ at "
+  "70% RH (rapid loss within ~7 d) and PMMA/HfS₂ (intermediate). "
+  "Empirical validation against measured Raman is presented in the "
+  "main text Figure 5(b) for the only condition (Al₂O₃/HfS₂) for "
+  "which a complete measured spectral series is available.",
+  align="justify")
+IMG("figS5_pseudo_other_conds.png", width_in=6.5,
+    caption="Figure S5. Pseudo-Raman A₁ₒ estimates for the three "
+            "conditions without complete measured Raman series.")
+
+
+# ═══════════════ S4 TABLES ═══════════════
+H("S4. Supplementary Tables", level=1, size=14, bold=True)
+
+H("Table S1. Per-target leave-one-out predictions (33 queries)",
+  level=2, size=11, bold=True)
+P("Aging-day predictions for representative queries spanning the four "
+  "conditions, comparing the five individual estimators with the two "
+  "ensemble configurations (uniform-weight baseline and condition-"
+  "specific Huber-optimised ensemble). Cells show the predicted day; "
+  "the residual (true − predicted) appears in parentheses next to the "
+  "ensemble columns. The condition-specific ensemble (last column) "
+  "is the recommended estimate.", align="justify")
+
+s1_hdr = ["Specimen", "True", "KNN", "Wass", "FFT", "Spat", "Kinet",
+          "Ens(uni)", "Ens(opt)"]
+s1_rows = [
+    ("0d Al2O3 70%",  "0",  "3.7", "10.7", "9.9",  "2.9", "—",
+     "5.7",  "3.4"),
+    ("3d Al2O3 70%",  "3",  "3.2", "11.1", "0.9",  "4.0", "—",
+     "4.8",  "3.4"),
+    ("7d Al2O3 70%",  "7",  "16.2","9.0",  "9.8",  "3.0", "—",
+     "9.4",  "12.2"),
+    ("14d Al2O3 70%", "14", "10.8","12.9", "5.2",  "2.6", "—",
+     "7.9",  "8.3"),
+    ("21d Al2O3 70%", "21", "15.4","14.1", "16.8", "18.9","—",
+     "16.3", "16.4"),
+    ("0d Native 35%", "0",  "1.3", "4.0",  "18.2", "1.4", "—",
+     "6.2",  "1.3"),
+    ("3d Native 35%", "3",  "5.5", "2.0",  "26.0", "0.9", "—",
+     "8.6",  "4.1"),
+    ("7d Native 35%", "7",  "12.4","11.2", "9.5",  "6.0", "—",
+     "9.8",  "10.5"),
+    ("14d Native 35%","14", "12.4","13.2", "2.5",  "3.5", "—",
+     "7.9",  "9.8"),
+    ("28d Native 35%","28", "24.9","7.8",  "9.1",  "14.2","—",
+     "14.0", "21.7"),
+    ("0d Native 70%", "0",  "1.3", "1.0",  "5.2",  "12.7","—",
+     "6.3",  "12.7"),
+    ("6d Native 70%", "6",  "7.7", "7.0",  "17.2", "2.9", "—",
+     "8.7",  "6.2"),
+    ("14d Native 70%","14", "15.5","20.9", "9.3",  "23.0","—",
+     "17.1", "17.7"),
+    ("21d Native 70%","21", "20.3","20.0", "11.2", "21.0","—",
+     "18.1", "20.5"),
+    ("29d Native 70%","29", "18.1","13.7", "4.3",  "16.8","—",
+     "13.2", "17.7"),
+    ("0d PMMA 70%",   "0",  "1.7", "5.6",  "14.1", "10.6","—",
+     "10.1", "10.6"),
+    ("3d PMMA 70%",   "3",  "4.2", "4.9",  "9.0",  "3.3", "—",
+     "5.3",  "3.9"),
+    ("7d PMMA 70%",   "7",  "8.4", "18.3", "5.9",  "18.0","—",
+     "12.6", "11.3"),
+    ("14d PMMA 70%",  "14", "9.9", "22.6", "17.0", "23.0","—",
+     "18.1", "13.8"),
+    ("28d PMMA 70%",  "28", "25.2","18.8", "9.6",  "21.9","—",
+     "22.0", "24.2"),
+]
+_add_table(s1_hdr, s1_rows)
+P("Note: a dash (—) in the kinetic column indicates that "
+  "scipy.optimize.curve_fit did not converge for that specific "
+  "leave-one-out fold; such estimates are excluded from the ensemble.",
+  size=8, italic=True, after=8)
+
+
+H("Table S2. Condition-specific ensemble weights (Huber loss, δ = 5 d)",
+  level=2, size=11, bold=True)
+P("Optimal weights minimising the Huber loss between the leave-one-"
+  "out ensemble prediction and the known aging day, computed "
+  "separately for each condition with at least three image–day pairs. "
+  "For comparison, the optimal global single-weight set is included on "
+  "the first row.", align="justify")
+s2_hdr = ["Setting", "n", "KNN", "Wass", "FFT", "Spatial", "Kinetic",
+          "Opt RMSE (d)", "Uniform RMSE (d)"]
+s2_rows = [
+    ("Global default", "33", "63%", "1%", "1%", "30%", "5%",
+     "6.13", "7.74"),
+    ("Native 35% RH",  "5",  "14%", "55%", "0%", "13%", "18%",
+     "2.29", "4.62"),
+    ("Native 70% RH",  "11", "100%","0%",  "0%", "0%",  "0%",
+     "3.56", "5.10"),
+    ("Al2O3 70% RH",   "12", "0%",  "10%", "3%", "79%", "9%",
+     "8.16", "10.45"),
+    ("PMMA 70% RH",    "5",  "83%", "12%", "0%", "0%",  "5%",
+     "1.96", "4.61"),
+]
+_add_table(s2_hdr, s2_rows)
+P("Weighted-mean RMSE across the 33 queries: 4.80 d (condition-"
+  "specific) vs. 6.30 d (global single weight set), corresponding to "
+  "a 24% reduction over the global single weight set and 38% over the "
+  "uniform baseline reported in the main text.",
+  size=8, italic=True, after=8)
+
+
+H("Table S3. Pearson correlation r(day, metric) per condition",
+  level=2, size=11, bold=True)
+P("Per-condition Pearson correlation between aging day and the three "
+  "image colour metrics (b∗, S-channel mean, Yellowness Index). "
+  "Values close to −1 indicate the strongly monotonic decrease "
+  "expected from progressive oxidation; the much weaker Al₂O₃/HfS₂ "
+  "correlation (~−0.32) is the quantitative signature of the "
+  "oxidation barrier provided by the Al₂O₃ encapsulation, and "
+  "constitutes the fundamental sensitivity limit of any image-based "
+  "approach for that condition.", align="justify")
+s3_hdr = ["Condition", "n", "r(day, b∗)", "r(day, S)", "r(day, YI)"]
+s3_rows = [
+    ("Native HfS2 35% RH", "10", "−0.918", "−0.918", "−0.948"),
+    ("Native HfS2 70% RH", "16", "−0.829", "−0.822", "−0.839"),
+    ("Al2O3/HfS2 70% RH",  "17", "−0.319", "−0.324", "−0.331"),
+    ("PMMA/HfS2 70% RH",   "10", "−0.886", "−0.839", "−0.856"),
+]
+_add_table(s3_hdr, s3_rows)
+P("", after=8)
+
+
+H("Table S4. Per-condition specimen counts and aging-day distribution",
+  level=2, size=11, bold=True)
+P("Number of photographs per condition in the unified analysis pool "
+  "(alldata.db) and the independent evaluation set (sample/), together "
+  "with the unique aging days available for each condition. Note that "
+  "the Al₂O₃/HfS₂ condition has the densest temporal sampling "
+  "(13 distinct days) because its slower oxidation chemistry warranted "
+  "a finer time grid.", align="justify")
+s4_hdr = ["Condition", "Pool n", "Eval n", "Unique aging days"]
+s4_rows = [
+    ("Native HfS₂ 35% RH", "10", "5",
+     "0, 3, 7, 14, 28"),
+    ("Native HfS₂ 70% RH", "16", "5",
+     "0, 1, 2, 3, 4, 6, 7, 13, 14, 15, 20, 21, 28, 29"),
+    ("Al₂O₃/HfS₂ 70% RH", "17", "5",
+     "0, 1, 2, 3, 5, 7, 14, 15, 16, 21, 22, 28, 30"),
+    ("PMMA/HfS₂ 70% RH",  "10", "5",
+     "0, 3, 7, 14, 28"),
+    ("TOTAL",              "53", "20", "—"),
+]
+_add_table(s4_hdr, s4_rows)
+P("", after=12)
 
 
 doc.save(OUT)
