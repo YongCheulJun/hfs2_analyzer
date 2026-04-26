@@ -976,6 +976,139 @@ def adv_fft_estimate(target_fft: dict,
     return {"est_day": est_day, "confidence": conf, "scores": scores}
 
 
+# cond 별 신뢰도 가드 — 산화 진행이 미미한 시편(예: Al2O3 코팅) 은
+# day 추정 정확도 본질적 한계. 이런 cond 는 confidence 캡 + 경고 표시.
+# 검증 데이터 (alldata.db, 53장): r(day, b*) Al2O3=-0.32 vs 다른 cond -0.83~-0.95.
+LOW_TIME_RESOLUTION_CONDS = {"Al2O3HfS2-70%RH"}
+LOW_TIME_RES_CONF_CAP = 30.0  # %
+LOW_TIME_RES_NOTE_KO = (
+    "⚠ Al₂O₃ 코팅 시편 — 코팅이 황 성분 산화를 막아 시계열 메트릭 변화가 "
+    "미미합니다 (Δb*≈2 in 30일 vs Native ≈25). day 추정 정확도 본질적 한계."
+)
+LOW_TIME_RES_NOTE_EN = (
+    "⚠ Al2O3-coated specimen — coating limits sulfur oxidation, so time-series "
+    "metric change is minimal (Δb*≈2 in 30d vs Native ≈25). Day estimation "
+    "accuracy is fundamentally limited."
+)
+
+
+def is_low_time_resolution_cond(cond) -> bool:
+    if not cond:
+        return False
+    return str(cond).strip() in LOW_TIME_RESOLUTION_CONDS
+
+
+def compute_stage_signatures(pool: list, cond_filter=None) -> dict:
+    """pool 의 day 분포를 3 stage (초기/중기/말기) 로 나누고 각 stage 의
+    메트릭 평균 (b*, s_mean, yellowness_idx) 을 계산.
+
+    cond_filter 가 주어지면 그 cond 만, 없으면 cond 별 dict 반환.
+
+    Returns:
+      cond_filter 지정: {"early": {b, s, yi, day_range}, "mid": ..., "late": ...}
+      미지정:          {cond: above_dict, ...}
+    """
+    from collections import defaultdict
+    by_cond = defaultdict(list)
+    for img in pool:
+        try:
+            d = float(img.get("day"))
+        except (TypeError, ValueError):
+            continue
+        b  = img.get("lab", {}).get("b", np.nan)
+        s  = img.get("s_mean", np.nan)
+        yi = img.get("yellowness_idx", np.nan)
+        if np.isnan(b) and np.isnan(s) and np.isnan(yi):
+            continue
+        cnd = (img.get("cond") or "").strip()
+        if cond_filter and cnd != cond_filter:
+            continue
+        by_cond[cnd].append({"day": d, "b": b, "s": s, "yi": yi})
+
+    def _stages(rows):
+        if len(rows) < 3:
+            return None
+        rows = sorted(rows, key=lambda r: r["day"])
+        days = [r["day"] for r in rows]
+        d_min, d_max = min(days), max(days)
+        if d_max - d_min < 1:
+            return None
+        # cond 별 day 범위를 1/3, 2/3 분할
+        t1 = d_min + (d_max - d_min) / 3
+        t2 = d_min + 2 * (d_max - d_min) / 3
+        early = [r for r in rows if r["day"] <  t1]
+        mid   = [r for r in rows if t1 <= r["day"] < t2]
+        late  = [r for r in rows if r["day"] >= t2]
+        out = {}
+        for label, sub, drng in (("early", early, (d_min, t1)),
+                                 ("mid",   mid,   (t1, t2)),
+                                 ("late",  late,  (t2, d_max))):
+            if not sub:
+                continue
+            out[label] = {
+                "b":   float(np.nanmean([r["b"]  for r in sub])),
+                "s":   float(np.nanmean([r["s"]  for r in sub])),
+                "yi":  float(np.nanmean([r["yi"] for r in sub])),
+                "n":   len(sub),
+                "day_range": (round(drng[0], 1), round(drng[1], 1)),
+            }
+        return out
+
+    if cond_filter:
+        rows = by_cond.get(cond_filter, [])
+        return _stages(rows) or {}
+    return {c: _stages(rs) for c, rs in by_cond.items()
+            if _stages(rs) is not None}
+
+
+def classify_target_stage(target_metrics: dict, stage_sigs: dict) -> dict:
+    """target 의 (b, s, yi) 와 각 stage 평균의 정규화 거리.
+
+    target_metrics : {"b":..., "s":..., "yi":...}
+    stage_sigs     : compute_stage_signatures 의 cond 별 dict
+        {"early": {b, s, yi, day_range, n}, "mid": ..., "late": ...}
+
+    Returns:
+      {"distances": {early: ..., mid: ..., late: ...},
+       "best_stage": "early"|"mid"|"late"|None,
+       "best_dist":  float | None,
+       "stage_sigs": stage_sigs (참조용)}
+    """
+    if not stage_sigs:
+        return {"distances": {}, "best_stage": None,
+                "best_dist": None, "stage_sigs": stage_sigs}
+
+    # 정규화 — 각 메트릭의 stage 간 range 로 나눔
+    keys = ("b", "s", "yi")
+    rng = {}
+    for k in keys:
+        vals = [s[k] for s in stage_sigs.values() if not np.isnan(s.get(k, np.nan))]
+        rng[k] = max(vals) - min(vals) if len(vals) >= 2 else 1.0
+        if rng[k] < 1e-6:
+            rng[k] = 1.0
+
+    t = {k: float(target_metrics.get(k, np.nan)) for k in keys}
+    distances = {}
+    for stage, sig in stage_sigs.items():
+        # 가용 메트릭만 — NaN 은 0 기여
+        d = 0.0; cnt = 0
+        for k in keys:
+            tv = t[k]; sv = sig.get(k, np.nan)
+            if np.isnan(tv) or np.isnan(sv):
+                continue
+            d += ((tv - sv) / rng[k]) ** 2
+            cnt += 1
+        distances[stage] = float((d / cnt) ** 0.5) if cnt > 0 else float("nan")
+
+    valid = {k: v for k, v in distances.items() if not np.isnan(v)}
+    if not valid:
+        return {"distances": distances, "best_stage": None,
+                "best_dist": None, "stage_sigs": stage_sigs}
+    best = min(valid, key=valid.get)
+    return {"distances": distances, "best_stage": best,
+            "best_dist": valid[best], "stage_sigs": stage_sigs}
+
+
 def adv_ensemble(knn_day: float | None, knn_conf: float,
                  wass_day: float | None, wass_conf: float,
                  fft_day: float | None,  fft_conf: float,
@@ -3086,11 +3219,17 @@ class App(_Base):
             except: return "-"
 
         if KO:
-            hdrs = ["#", "이름", "조건", "날짜",
-                    "ROI", "b*", "S-ch", "YI", "추정일", "신뢰도"]
+            hdrs = ["#", "이름", "조건", "날짜", "ROI",
+                    "b*", "S-ch", "YI", "추정일", "신뢰도",
+                    "Stage", "비고"]
         else:
-            hdrs = ["#", "Name", "Cond", "Day",
-                    "ROI", "b*", "S-ch", "YI", "Est.Day", "Conf"]
+            hdrs = ["#", "Name", "Cond", "Day", "ROI",
+                    "b*", "S-ch", "YI", "Est.Day", "Conf",
+                    "Stage", "Note"]
+
+        stage_label = ({"early": "초기", "mid": "중기", "late": "말기"}
+                       if KO else {"early": "Early", "mid": "Mid",
+                                   "late": "Late"})
 
         rows_html = ""
         for i, t in enumerate(pred_targets, 1):
@@ -3098,22 +3237,38 @@ class App(_Base):
             roi = t.get("roi") or (None,)*4
             roi_str = (f"{roi[0]},{roi[1]}-{roi[2]},{roi[3]}"
                        if all(v is not None for v in roi[:4]) else "-")
-            stats = res.get("stats") or {}
+            stats = res.get("target_metrics") or res.get("stats") or {}
+            # target_metrics 가 dict 안에 lab dict 가짐
+            lab_b = (stats.get("lab", {}).get("b")
+                     if isinstance(stats.get("lab"), dict)
+                     else stats.get("lab_b"))
+            s_mean = stats.get("s_mean")
+            yi = stats.get("yellowness_idx")
             est = res.get("est_day")
             conf = res.get("confidence")
+            stage_info = res.get("stage") or {}
+            best_stage = stage_info.get("best_stage")
+            stage_str = stage_label.get(best_stage, "-") if best_stage else "-"
+            note = ""
+            if res.get("low_time_res"):
+                note = "⚠ Al₂O₃ 코팅 — 정확도 한계" if KO else "⚠ Al2O3 — limited"
             row = [
                 str(i),
                 _esc(t.get("name", "")[:32]),
                 _esc(t.get("cond_hint") or t.get("cond") or ""),
                 _esc(t.get("day") or ""),
                 roi_str,
-                fv(stats.get("lab_b") if stats else None),
-                fv(stats.get("s_mean") if stats else None, 0),
-                fv(stats.get("yellowness_idx") if stats else None, 0),
+                fv(lab_b),
+                fv(s_mean, 0),
+                fv(yi, 0),
                 (fv(est, 1) + ("일" if KO else "d")) if est is not None else "-",
                 (fv(conf, 0) + "%") if conf is not None else "-",
+                stage_str,
+                _esc(note),
             ]
             bg = "#f0f4fa" if i % 2 == 0 else "#ffffff"
+            if res.get("low_time_res"):
+                bg = "#fff8e1"  # Al2O3 행 노란 배경
             tds = "".join(f"<td>{c}</td>" for c in row)
             rows_html += f"<tr style='background:{bg}'>{tds}</tr>"
         ths_html = "".join(f"<th>{h}</th>" for h in hdrs)
@@ -7368,6 +7523,43 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                       f"{type(ex).__name__}: {ex}")
                 result["adv"] = None
 
+        # Stage 분류 (초기/중기/말기) — target 메트릭 vs cond 별 stage 평균
+        try:
+            target_cond = (cond_input
+                           or target.get("cond")
+                           or "").strip()
+            stage_sigs = compute_stage_signatures(
+                self.images, cond_filter=target_cond)
+            t_metrics = {
+                "b":  float(target.get("lab", {}).get("b", np.nan)),
+                "s":  float(target.get("s_mean", np.nan)),
+                "yi": float(target.get("yellowness_idx", np.nan)),
+            }
+            stage_res = classify_target_stage(t_metrics, stage_sigs)
+            stage_res["cond_used"] = target_cond
+            result["stage"] = stage_res
+        except Exception as ex:
+            print(f"[pred-stage] {type(ex).__name__}: {ex}")
+            result["stage"] = None
+
+        # Al2O3 같은 low-time-resolution cond 신뢰도 가드 + 경고
+        target_cond_str = (cond_input or target.get("cond") or "").strip()
+        if is_low_time_resolution_cond(target_cond_str):
+            result["low_time_res"] = True
+            result["low_time_res_note"] = LOW_TIME_RES_NOTE_KO
+            # confidence 캡 적용 (KNN ensemble 결과에)
+            if result.get("confidence") is not None:
+                result["confidence"] = min(
+                    float(result["confidence"]), LOW_TIME_RES_CONF_CAP)
+            # adv 의 ens_conf 도 캡
+            if (result.get("adv")
+                    and result["adv"].get("ens_conf") is not None):
+                result["adv"]["ens_conf"] = min(
+                    float(result["adv"]["ens_conf"]),
+                    LOW_TIME_RES_CONF_CAP)
+        else:
+            result["low_time_res"] = False
+
         return result
 
     def _compute_advanced_for_target(self, target: dict, pool: list,
@@ -9522,22 +9714,53 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             tk.Label(rf, text=f"{wv*100:.0f}%", bg=PANEL,
                      fg=SUB, font=LF, width=4).pack(side="right")
 
-        # 해석 텍스트 — 평가대상 메타 + 결과 요약
+        # 해석 텍스트 — 평가대상 메타 + 결과 요약 + stage + 경고
         nm = t.get("name", "")
         cnd = t.get("cond_hint") or t.get("cond") or "-"
         day_str = str(t.get("day", "") or "-")
         roi = t.get("roi") or (None,)*4
         roi_str = (f"{roi[0]},{roi[1]} - {roi[2]},{roi[3]}"
                    if all(v is not None for v in roi[:4]) else "-")
+
+        warn_block = ""
+        if res.get("low_time_res"):
+            warn_block = "\n" + (res.get("low_time_res_note") or "") + "\n"
+
+        stage_block = ""
+        st = res.get("stage")
+        if st and st.get("best_stage"):
+            sigs = st.get("stage_sigs", {})
+            dists = st.get("distances", {})
+            label_map = {"early": "초기 (Early)",
+                         "mid":   "중기 (Mid)",
+                         "late":  "말기 (Late)"}
+            lines = ["",
+                     "📊 Stage 분류 (cond 별 day 1/3, 2/3 분할):"]
+            for s in ("early", "mid", "late"):
+                if s not in sigs:
+                    continue
+                sg = sigs[s]
+                d_lo, d_hi = sg.get("day_range", ("?", "?"))
+                dist = dists.get(s, float("nan"))
+                marker = "  ◀ 가장 가까움" if s == st["best_stage"] else ""
+                lines.append(
+                    f"  {label_map[s]:<13} "
+                    f"day {d_lo}~{d_hi} (n={sg.get('n','-')})  "
+                    f"b*={sg['b']:.1f} S={sg['s']:.1f} YI={sg['yi']:.1f}  "
+                    f"|  거리 {dist:.3f}{marker}")
+            stage_block = "\n".join(lines) + "\n"
+
         interp = (
             f"📷 {nm}\n"
             f"   조건: {cnd}    Day: {day_str}\n"
-            f"   ROI:  {roi_str}\n\n"
-            f"5개 방법 추정값 (위 표 참조)\n"
-            f"앙상블: {fmt(ens_d, ens_c)}\n\n"
-            f"가중치 (저장된 adv_weights 적용 시):\n"
+            f"   ROI:  {roi_str}\n"
+            + warn_block +
+            f"\n5개 방법 추정값 (위 표 참조)\n"
+            f"앙상블: {fmt(ens_d, ens_c)}\n"
+            f"\n가중치 (저장된 adv_weights 적용 시):\n"
             + "\n".join(f"  {n:<8s} {weights.get(n,0)*100:>5.1f}%"
                         for n in ("knn","wass","fft","spatial","kinetic"))
+            + stage_block
         )
         self._adv_set_interp(interp)
 
