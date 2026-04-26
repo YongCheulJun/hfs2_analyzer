@@ -4,3 +4,5 @@ Pillow>=10.0
 matplotlib>=3.7
 tkinterdnd2>=0.3
 anthropic>=0.40
+# scipy: optional. 없으면 advanced weight 최적화가 grid search fallback 사용.
+scipy>=1.10

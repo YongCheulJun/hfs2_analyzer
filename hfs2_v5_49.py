@@ -978,10 +978,18 @@ def adv_ensemble(knn_day: float | None, knn_conf: float,
                  wass_day: float | None, wass_conf: float,
                  fft_day: float | None,  fft_conf: float,
                  spatial_day: float | None = None, spatial_conf: float = 0,
-                 kinetic_day: float | None = None, kinetic_conf: float = 0) -> dict:
+                 kinetic_day: float | None = None, kinetic_conf: float = 0,
+                 prior_weights: dict | None = None) -> dict:
     """
-    최대 5개 추정치를 신뢰도 가중 평균으로 앙상블.
+    최대 5개 추정치를 가중 평균으로 앙상블.
     신뢰도 20% 미만 추정치는 제외.
+
+    prior_weights : dict | None
+        {method_name: weight} — 있으면 confidence 비율 대신 이 prior 로 결합.
+        가용 candidate (conf>=20) 의 가중치를 합으로 정규화. 모든 prior 가
+        0 이거나 가용 candidate 가 모두 prior 0 이면 confidence 비율 fallback.
+        ground truth 기반 최적화된 가중치를 적용할 때 사용.
+
     반환: {est_day, confidence, weights: {knn, wass, fft, spatial, kinetic}}
     """
     candidates = []
@@ -993,24 +1001,143 @@ def adv_ensemble(knn_day: float | None, knn_conf: float,
         if day is not None and conf >= 20.0:
             candidates.append((name, day, conf))
 
-    if not candidates:
-        return {"est_day": None, "confidence": 0,
-                "weights": {"knn": 0, "wass": 0, "fft": 0,
-                            "spatial": 0, "kinetic": 0}}
+    weights_full = {"knn": 0.0, "wass": 0.0, "fft": 0.0,
+                    "spatial": 0.0, "kinetic": 0.0}
 
-    total_c = sum(c for _, _, c in candidates)
-    est_day = sum(d * c for _, d, c in candidates) / total_c
+    if not candidates:
+        return {"est_day": None, "confidence": 0, "weights": weights_full}
+
+    # 가중치 결정
+    use_prior = False
+    if prior_weights:
+        raw = {n: max(0.0, float(prior_weights.get(n, 0.0)))
+               for n, _, _ in candidates}
+        if sum(raw.values()) > 0:
+            use_prior = True
+            wsum = sum(raw.values())
+            weights_d = {n: raw[n] / wsum for n in raw}
+    if not use_prior:
+        # 기존 confidence 비율
+        total_c = sum(c for _, _, c in candidates)
+        weights_d = {n: c / total_c for n, _, c in candidates}
+
+    est_day = sum(d * weights_d[n] for n, d, _ in candidates)
     days    = [d for _, d, _ in candidates]
     spread  = max(days) - min(days) if len(days) > 1 else 0
     consistency_bonus = max(0.0, 10.0 - spread * 2.0)
-    ens_conf = min(100.0, total_c / len(candidates) + consistency_bonus)
+    avg_conf = sum(weights_d[n] * c for n, _, c in candidates)
+    ens_conf = min(100.0, avg_conf + consistency_bonus)
 
-    weights = {"knn": 0.0, "wass": 0.0, "fft": 0.0,
-               "spatial": 0.0, "kinetic": 0.0}
-    for name, _, conf in candidates:
-        weights[name] = conf / total_c
+    for n in weights_d:
+        weights_full[n] = weights_d[n]
 
-    return {"est_day": est_day, "confidence": ens_conf, "weights": weights}
+    return {"est_day": est_day, "confidence": ens_conf, "weights": weights_full}
+
+
+def optimize_advanced_weights(estimates: list) -> dict:
+    """Ground-truth 기반 advanced ensemble weight 최적화.
+
+    estimates : list of tuples (true_day, results_dict)
+        results_dict = {"knn": (est_day, conf), "wass": ..., ...}
+        est_day=None 인 method 는 그 row 의 column-mean 으로 임퓨트.
+
+    Returns:
+        {weights: {knn, wass, fft, spatial, kinetic}, rmse: float, n: int,
+         baseline_rmse: float, per_method_rmse: {knn: ..., ...}}
+    """
+    methods = ["knn", "wass", "fft", "spatial", "kinetic"]
+    rows = []
+    truths = []
+    for true_day, m_res in estimates:
+        ests = []
+        for m in methods:
+            day, _ = m_res.get(m, (None, 0))
+            ests.append(float(day) if day is not None else np.nan)
+        rows.append(ests)
+        truths.append(float(true_day))
+
+    A = np.array(rows, dtype=float)
+    y = np.array(truths, dtype=float)
+    if A.size == 0:
+        return {"weights": {m: 0.2 for m in methods},
+                "rmse": float("inf"), "n": 0,
+                "baseline_rmse": float("inf"),
+                "per_method_rmse": {m: float("inf") for m in methods}}
+
+    # NaN cell 을 column-mean 으로 대체 (column 전체가 NaN 이면 0)
+    col_means = np.nanmean(A, axis=0)
+    col_means = np.where(np.isnan(col_means), 0.0, col_means)
+    nan_mask = np.isnan(A)
+    if nan_mask.any():
+        idx = np.where(nan_mask)
+        A[idx] = np.take(col_means, idx[1])
+
+    # method 별 단독 RMSE (참고용)
+    per_method_rmse = {}
+    for j, m in enumerate(methods):
+        per_method_rmse[m] = float(np.sqrt(np.mean((A[:, j] - y) ** 2)))
+
+    # baseline: 균등 가중
+    baseline_pred = A.mean(axis=1)
+    baseline_rmse = float(np.sqrt(np.mean((baseline_pred - y) ** 2)))
+
+    # 최적화: scipy.optimize.minimize (없으면 grid search)
+    def loss(w):
+        ww = np.maximum(np.asarray(w, dtype=float), 0.0)
+        s = ww.sum()
+        if s <= 0:
+            return 1e12
+        ww = ww / s
+        pred = A @ ww
+        return float(np.mean((pred - y) ** 2))
+
+    best_w = np.ones(5) / 5
+    best_loss = loss(best_w)
+    try:
+        from scipy.optimize import minimize
+        # multi-start: 균등 + method 별 100% 시작점 5개
+        starts = [np.ones(5) / 5]
+        for j in range(5):
+            s = np.full(5, 0.05); s[j] = 0.80
+            starts.append(s)
+        for x0 in starts:
+            res = minimize(loss, x0, bounds=[(0, 1)] * 5,
+                           method="L-BFGS-B")
+            if res.fun < best_loss:
+                best_loss = float(res.fun)
+                best_w = np.maximum(np.asarray(res.x, dtype=float), 0.0)
+        s = best_w.sum()
+        if s > 0:
+            best_w = best_w / s
+    except Exception as e:
+        print(f"[optimize_advanced_weights] scipy unavailable ({e}); grid search")
+        # 단순 grid 0.1 단위 — 11^5 = 161051 점
+        best_w = np.ones(5) / 5
+        best_loss = loss(best_w)
+        steps = np.linspace(0.0, 1.0, 11)
+        for w0 in steps:
+            for w1 in steps:
+                if w0 + w1 > 1: break
+                for w2 in steps:
+                    if w0 + w1 + w2 > 1: break
+                    for w3 in steps:
+                        if w0 + w1 + w2 + w3 > 1: break
+                        w4 = 1 - (w0 + w1 + w2 + w3)
+                        if w4 < 0: continue
+                        cand = np.array([w0, w1, w2, w3, w4])
+                        v = loss(cand)
+                        if v < best_loss:
+                            best_loss = v
+                            best_w = cand
+
+    rmse = float(np.sqrt(best_loss))
+    return {
+        "weights": {m: float(best_w[j]) for j, m in enumerate(methods)},
+        "rmse":          rmse,
+        "n":             int(len(y)),
+        "baseline_rmse": baseline_rmse,
+        "per_method_rmse": per_method_rmse,
+    }
 
 
 # ══════════════════════════════════════════════
@@ -8601,6 +8728,13 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             bg=ACCENT, fg="white", font=MFB,
             relief="flat", padx=14, pady=4, cursor="hand2")
         self._adv_run_btn.pack(side="right", padx=8, pady=6)
+        # 라만 매칭된 이미지(ground truth) 기반 ensemble weight 최적화
+        self._adv_opt_btn = tk.Button(
+            hdr, text=_L("🎯 가중치 최적화", "🎯 Optimize Weights"),
+            command=self._adv_optimize_weights,
+            bg=BTN, fg=TXT, font=LF,
+            relief="flat", padx=10, pady=4, cursor="hand2")
+        self._adv_opt_btn.pack(side="right", padx=4, pady=6)
 
         # ── 메인 영역 (좌: 차트 3개 / 우: 결과 패널) ────────
         body = tk.Frame(f, bg=BG)
@@ -8747,6 +8881,184 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         """탭 전환 시 호출 — 이전 결과 있으면 유지, 없으면 안내만"""
         pass   # 자동 재실행하지 않음 (Run 버튼 클릭 시만 실행)
 
+    def _adv_compute_for_query(self, q_img: dict, pool: list) -> dict:
+        """단일 query 이미지에 대해 5개 method 의 (est_day, conf) 반환.
+
+        leave-one-out 평가용. self.images 를 임시 swap 해 _pred_compute_one
+        이 query 제외 pool 만 보도록 함.
+        """
+        rgb  = q_img.get("rgb")
+        mask = q_img.get("mask")
+        if rgb is None or mask is None:
+            return {m: (None, 0) for m in
+                    ("knn","wass","fft","spatial","kinetic")}
+        roi = q_img.get("roi", (0, 0, rgb.shape[1], rgb.shape[0]))
+        rows = self.cfg_rows.get() if hasattr(self, "cfg_rows") else 3
+        cols = self.cfg_cols.get() if hasattr(self, "cfg_cols") else 3
+
+        adv_precompute_pool(pool, rows=rows, cols=cols)
+
+        t_hist    = adv_hist_signature(rgb, mask)
+        t_fft     = adv_fft_features(rgb, mask)
+        t_spatial = adv_spatial_features(rgb, mask, roi, rows, cols)
+
+        try:
+            kp = adv_kinetic_fit(pool)
+        except Exception:
+            kp = {}
+
+        w_res = adv_wasserstein_estimate(t_hist, pool)
+        f_res = adv_fft_estimate(t_fft, pool)
+        s_res = adv_spatial_estimate(t_spatial, pool, rows, cols)
+        t_b = q_img.get("lab", {}).get("b", np.nan)
+        k_res = adv_kinetic_estimate(t_b, kp, q_img.get("cond", ""))
+
+        # KNN — _pred_compute_one 사용 (self.images swap 으로 leave-one-out)
+        knn_day, knn_conf = None, 0
+        orig_images = self.images
+        try:
+            self.images = pool
+            knn_t = {"rgb": rgb, "roi": roi,
+                     "cond_hint": q_img.get("cond", "")}
+            knn_res = self._pred_compute_one(knn_t)
+        except Exception:
+            knn_res = None
+        finally:
+            self.images = orig_images
+        if knn_res:
+            knn_day = knn_res.get("est_day")
+            knn_conf = knn_res.get("confidence", 0)
+
+        return {
+            "knn":     (knn_day,           knn_conf),
+            "wass":    (w_res["est_day"],  w_res["confidence"]),
+            "fft":     (f_res["est_day"],  f_res["confidence"]),
+            "spatial": (s_res["est_day"],  s_res["confidence"]),
+            "kinetic": (k_res["est_day"],  k_res["confidence"]),
+        }
+
+    def _adv_optimize_weights(self):
+        """🎯 라만 매칭된 이미지를 ground truth 로 ensemble weight 최적화.
+
+        leave-one-out 평가 후 RMSE 최소화 가중치를 settings.json
+        ("adv_weights" 키) 에 저장. 이후 Advanced 분석은 이 가중치 사용.
+        """
+        # ground truth subset
+        gt_imgs = []
+        for img in self.images:
+            if img.get("raman_id") is None:
+                continue
+            if img.get("rgb") is None or img.get("mask") is None:
+                continue
+            try:
+                day = float(img.get("day"))
+            except (ValueError, TypeError):
+                continue
+            gt_imgs.append((img, day))
+
+        if len(gt_imgs) < 5:
+            messagebox.showwarning(
+                _L("Ground truth 부족", "Insufficient ground truth"),
+                _L(f"라만 매칭된 이미지가 {len(gt_imgs)}장 입니다.\n"
+                   f"최소 5장 필요. 라만 데이터를 추가하거나 매칭을 갱신하세요.",
+                   f"Only {len(gt_imgs)} raman-linked images found.\n"
+                   f"Need at least 5. Add Raman data or update links."))
+            return
+
+        all_imgs = [img for img in self.images
+                    if img.get("rgb") is not None
+                    and img.get("mask") is not None]
+
+        # 진행 상태 — 콘솔 + status bar
+        n = len(gt_imgs)
+        self._set_status(
+            _L(f"🎯 가중치 최적화: {n}장 leave-one-out 평가 중...",
+               f"🎯 Optimizing: {n} LOO evaluations..."))
+        self.update_idletasks()
+
+        estimates = []
+        skipped = []
+        import time
+        t0 = time.time()
+        for i, (q, true_day) in enumerate(gt_imgs):
+            try:
+                pool = [im for im in all_imgs if im is not q]
+                if not pool:
+                    skipped.append(q.get("name", "?"))
+                    continue
+                m_results = self._adv_compute_for_query(q, pool)
+                estimates.append((true_day, m_results))
+            except Exception as ex:
+                print(f"[adv-opt] skip {q.get('name','?')}: "
+                      f"{type(ex).__name__}: {ex}")
+                skipped.append(q.get("name", "?"))
+            self._set_status(
+                _L(f"🎯 가중치 최적화: {i+1}/{n} "
+                   f"({(time.time()-t0):.1f}s 경과)",
+                   f"🎯 Optimizing: {i+1}/{n} "
+                   f"({(time.time()-t0):.1f}s elapsed)"))
+            self.update_idletasks()
+
+        if len(estimates) < 5:
+            messagebox.showerror(
+                _L("실패", "Failed"),
+                _L(f"수집된 estimate {len(estimates)}장 — 부족 (≥5 필요).",
+                   f"Only {len(estimates)} estimates — insufficient (≥5)."))
+            return
+
+        opt = optimize_advanced_weights(estimates)
+
+        # settings 저장
+        settings = load_settings()
+        settings["adv_weights"] = opt["weights"]
+        save_settings(settings)
+
+        methods = ["knn", "wass", "fft", "spatial", "kinetic"]
+        improve_pct = 0.0
+        if opt["baseline_rmse"] > 0:
+            improve_pct = (opt["baseline_rmse"] - opt["rmse"]) \
+                          / opt["baseline_rmse"] * 100
+
+        if (lambda: True)():  # 단일 메시지 박스 (KO/EN 토글)
+            if hasattr(self, "_lang_var") and self._lang_var.get() == "ko":
+                msg = (
+                    f"앙상블 가중치 최적화 완료\n\n"
+                    f"Ground truth (라만 매칭 이미지): "
+                    f"{len(estimates)}장\n"
+                    f"건너뜀: {len(skipped)}장\n\n"
+                    f"균등 weight RMSE: {opt['baseline_rmse']:.2f} 일\n"
+                    f"최적 weight RMSE: {opt['rmse']:.2f} 일\n"
+                    f"개선: {improve_pct:.1f}%\n\n"
+                    f"최적 가중치 (settings.json 저장됨):\n"
+                    + "\n".join(
+                        f"  {m:<8s} {opt['weights'][m]*100:>5.1f}%   "
+                        f"(단독 RMSE {opt['per_method_rmse'][m]:.2f}일)"
+                        for m in methods)
+                    + "\n\n다음 Advanced 분석부터 적용됩니다.")
+            else:
+                msg = (
+                    f"Ensemble weight optimization complete\n\n"
+                    f"Ground truth (raman-linked): "
+                    f"{len(estimates)} images\n"
+                    f"Skipped: {len(skipped)}\n\n"
+                    f"Uniform weight RMSE: {opt['baseline_rmse']:.2f} d\n"
+                    f"Optimal weight RMSE: {opt['rmse']:.2f} d\n"
+                    f"Improvement: {improve_pct:.1f}%\n\n"
+                    f"Optimal weights (saved to settings.json):\n"
+                    + "\n".join(
+                        f"  {m:<8s} {opt['weights'][m]*100:>5.1f}%   "
+                        f"(solo RMSE {opt['per_method_rmse'][m]:.2f}d)"
+                        for m in methods)
+                    + "\n\nApplied from next Advanced run.")
+
+        messagebox.showinfo(
+            _L("최적화 완료", "Optimization complete"), msg)
+        self._set_status(
+            _L(f"✓ 가중치 최적화 — RMSE {opt['rmse']:.2f}일 "
+               f"(균등 {opt['baseline_rmse']:.2f}일)",
+               f"✓ Weights optimized — RMSE {opt['rmse']:.2f}d "
+               f"(uniform {opt['baseline_rmse']:.2f}d)"))
+
     def _adv_run(self):
         """▶ Run Advanced Estimation 버튼 핸들러"""
         # ── Evaluation 탭 결과 재사용 ────────────────────────
@@ -8825,14 +9137,23 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         kinetic_day, kinetic_conf = k_res["est_day"], k_res["confidence"]
 
         # ── 5. 앙상블 ────────────────────────────────────────
+        # settings.json 의 adv_weights 가 있으면 prior 로 적용 — 라만 매칭
+        # 이미지 ground truth 로 학습된 최적 가중치
+        try:
+            _saved = load_settings().get("adv_weights")
+        except Exception:
+            _saved = None
         ens = adv_ensemble(knn_day,     knn_conf,
                            wass_day,    wass_conf,
                            fft_day,     fft_conf,
                            spatial_day, spatial_conf,
-                           kinetic_day, kinetic_conf)
+                           kinetic_day, kinetic_conf,
+                           prior_weights=_saved)
         ens_day  = ens["est_day"]
         ens_conf = ens["confidence"]
         weights  = ens["weights"]
+        if _saved:
+            print(f"[adv-ensemble] using saved adv_weights: {_saved}")
 
         # ── 6. 결과 저장 ─────────────────────────────────────
         self._last_adv_ctx = {
