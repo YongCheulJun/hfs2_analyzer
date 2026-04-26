@@ -1059,16 +1059,27 @@ def _resolve_adv_prior(saved, cond=None):
     return None
 
 
-def optimize_advanced_weights(estimates: list) -> dict:
+def optimize_advanced_weights(estimates: list,
+                               huber_delta: float = 5.0) -> dict:
     """Ground-truth 기반 advanced ensemble weight 최적화.
+
+    Huber loss (delta=huber_delta 일) 로 outlier 영향 축소:
+      |err| ≤ delta: 0.5 · err²
+      |err| > delta: delta · (|err| - 0.5·delta)
+    → 큰 편차 (>delta) 가 squared 로 폭발하지 않고 linear 로 페널티.
+      Al2O3 의 22day(-9.8d) / 30day(-19.4d) 같은 outlier 가 있을 때
+      MSE 학습이 이런 점에 끌려가는 것을 방지.
 
     estimates : list of tuples (true_day, results_dict)
         results_dict = {"knn": (est_day, conf), "wass": ..., ...}
         est_day=None 인 method 는 그 row 의 column-mean 으로 임퓨트.
+    huber_delta : float
+        outlier 임계 (단위: 일). 0 또는 매우 크면 사실상 MSE.
 
     Returns:
         {weights: {knn, wass, fft, spatial, kinetic}, rmse: float, n: int,
-         baseline_rmse: float, per_method_rmse: {knn: ..., ...}}
+         baseline_rmse: float, per_method_rmse: {knn: ..., ...},
+         huber_loss: float}
     """
     methods = ["knn", "wass", "fft", "spatial", "kinetic"]
     rows = []
@@ -1106,7 +1117,7 @@ def optimize_advanced_weights(estimates: list) -> dict:
     baseline_pred = A.mean(axis=1)
     baseline_rmse = float(np.sqrt(np.mean((baseline_pred - y) ** 2)))
 
-    # 최적화: scipy.optimize.minimize (없으면 grid search)
+    # 최적화: Huber loss + scipy.optimize.minimize (없으면 grid search)
     def loss(w):
         ww = np.maximum(np.asarray(w, dtype=float), 0.0)
         s = ww.sum()
@@ -1114,7 +1125,15 @@ def optimize_advanced_weights(estimates: list) -> dict:
             return 1e12
         ww = ww / s
         pred = A @ ww
-        return float(np.mean((pred - y) ** 2))
+        err = pred - y
+        abs_err = np.abs(err)
+        if huber_delta > 0:
+            d = float(huber_delta)
+            huber = np.where(abs_err <= d,
+                             0.5 * err * err,
+                             d * (abs_err - 0.5 * d))
+            return float(np.mean(huber))
+        return float(np.mean(err * err))
 
     best_w = np.ones(5) / 5
     best_loss = loss(best_w)
@@ -1155,13 +1174,17 @@ def optimize_advanced_weights(estimates: list) -> dict:
                             best_loss = v
                             best_w = cand
 
-    rmse = float(np.sqrt(best_loss))
+    # RMSE 는 best_w 에 대한 정확한 RMSE (Huber loss 와 별개)
+    pred = A @ best_w
+    rmse = float(np.sqrt(np.mean((pred - y) ** 2)))
     return {
         "weights": {m: float(best_w[j]) for j, m in enumerate(methods)},
         "rmse":          rmse,
         "n":             int(len(y)),
         "baseline_rmse": baseline_rmse,
         "per_method_rmse": per_method_rmse,
+        "huber_loss":    float(best_loss),
+        "huber_delta":   float(huber_delta),
     }
 
 
