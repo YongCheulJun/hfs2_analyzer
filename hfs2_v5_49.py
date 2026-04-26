@@ -93,9 +93,11 @@ TF  = ("Segoe UI", 10, "bold")
 
 COND_COLORS = ["#3b82f6","#16a34a","#d97706","#7c3aed",
                "#dc2626","#0d9488","#b45309","#db2777"]
-EXTRA_TARGET_COLORS = ["#0ea5e9", "#f97316", "#ec4899", "#14b8a6"]
+EXTRA_TARGET_COLORS = ["#0ea5e9", "#f97316", "#ec4899", "#14b8a6",
+                       "#a855f7", "#22c55e", "#eab308", "#ef4444",
+                       "#06b6d4", "#f59e0b", "#84cc16", "#8b5cf6"]
 TARGET_COLOR_PALETTE = COND_COLORS + EXTRA_TARGET_COLORS
-PRED_MAX_TARGETS = 8
+PRED_MAX_TARGETS = 20
 _IMG_EXTS = {".png",".jpg",".jpeg",".bmp",".tiff",".tif"}
 
 # ══════════════════════════════════════════════
@@ -6178,7 +6180,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         left.pack(side="left", fill="y", padx=(0,4))
         left.pack_propagate(False)
 
-        # 헤더 (N/8 표시)
+        # 헤더 (N/MAX 표시)
         hdr_row = tk.Frame(left, bg=PANEL2,
                            highlightbackground=BORDER,
                            highlightthickness=1)
@@ -6186,7 +6188,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         tk.Label(hdr_row,
                  text=_L("  🎯 평가대상", "  🎯 Evaluation Targets"),
                  bg=PANEL2, fg=TXT, font=MFB).pack(side="left", pady=4)
-        self._pred_count_var = tk.StringVar(value="0/8")
+        self._pred_count_var = tk.StringVar(value=f"0/{PRED_MAX_TARGETS}")
         tk.Label(hdr_row, textvariable=self._pred_count_var,
                  bg=PANEL2, fg=ACCENT, font=MFB).pack(side="right", padx=8)
 
