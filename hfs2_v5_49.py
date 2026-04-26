@@ -7177,8 +7177,13 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
     # ─────────────────────────────────────────
     #  분석 — 단일 target / 전체 실행
     # ─────────────────────────────────────────
-    def _pred_compute_one(self, t: dict):
-        """단일 target 분석. 결과 dict 를 반환 (또는 None)."""
+    def _pred_compute_one(self, t: dict, with_advanced: bool = True):
+        """단일 target 분석. 결과 dict 를 반환 (또는 None).
+
+        with_advanced=False 이면 advanced 분석 (5 methods) 생략 — LOO
+        평가 시 (자기 자신 _adv_compute_for_query 안에서 KNN 용으로
+        호출됨) 무한 재계산 방지.
+        """
         rgb = t.get("rgb")
         if rgb is None:
             return None
@@ -7301,14 +7306,15 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         }
 
         # Advanced 분석 추가 — 5 methods + ensemble (saved weights 적용)
-        try:
-            adv_res = self._compute_advanced_for_target(
-                target, pool_cond, est_day, confidence)
-            result["adv"] = adv_res
-        except Exception as ex:
-            print(f"[pred-adv] target adv failed: "
-                  f"{type(ex).__name__}: {ex}")
-            result["adv"] = None
+        if with_advanced:
+            try:
+                adv_res = self._compute_advanced_for_target(
+                    target, pool_cond, est_day, confidence)
+                result["adv"] = adv_res
+            except Exception as ex:
+                print(f"[pred-adv] target adv failed: "
+                      f"{type(ex).__name__}: {ex}")
+                result["adv"] = None
 
         return result
 
@@ -8870,11 +8876,45 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         # 우측: 결과 패널
         res_f = tk.Frame(body, bg=PANEL,
                          highlightbackground=BORDER, highlightthickness=1,
-                         width=280)
+                         width=360)
         res_f.pack(side="right", fill="y", padx=(6, 0))
         res_f.pack_propagate(False)
 
-        tk.Label(res_f, text="  📋 Method Comparison",
+        # ── 평가대상 결과 목록 (Treeview) ────────────────────
+        tk.Label(res_f, text=_L("  🎯 평가대상 결과",
+                                "  🎯 Targets — Results"),
+                 bg=PANEL2, fg=TXT, font=MFB,
+                 highlightbackground=BORDER,
+                 highlightthickness=1).pack(fill="x")
+
+        from tkinter import ttk as _ttk
+        tv_f = tk.Frame(res_f, bg=PANEL)
+        tv_f.pack(fill="x", padx=4, pady=(2, 4))
+        cols_def = (
+            ("name", _L("이름", "Name"), 110, "w"),
+            ("cond", _L("조건", "Cond"),  90, "w"),
+            ("day",  _L("Day",  "Day"),   34, "center"),
+            ("ens",  _L("앙상블(d)", "Ens(d)"), 56, "center"),
+            ("conf", _L("Conf%", "Conf%"), 50, "center"),
+        )
+        self._adv_tv = _ttk.Treeview(
+            tv_f, columns=[c[0] for c in cols_def],
+            show="headings", height=8, selectmode="browse")
+        for key, label, w, anchor in cols_def:
+            self._adv_tv.heading(key, text=label)
+            self._adv_tv.column(key, width=w, anchor=anchor)
+        self._adv_tv.pack(side="left", fill="x", expand=True)
+        tv_sb = tk.Scrollbar(tv_f, command=self._adv_tv.yview)
+        tv_sb.pack(side="right", fill="y")
+        self._adv_tv.configure(yscrollcommand=tv_sb.set)
+        self._adv_tv.bind("<<TreeviewSelect>>", self._adv_on_target_select)
+        # tid 매핑: tree iid → tid
+        self._adv_tv_tid = {}
+
+        tk.Frame(res_f, bg=BORDER, height=1).pack(fill="x", padx=4, pady=2)
+
+        tk.Label(res_f, text=_L("  📋 선택된 평가대상 — 방법별 결과",
+                                "  📋 Selected Target — Methods"),
                  bg=PANEL2, fg=TXT, font=MFB,
                  highlightbackground=BORDER,
                  highlightthickness=1).pack(fill="x")
@@ -8991,7 +9031,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             self.images = pool
             knn_t = {"rgb": rgb, "roi": roi,
                      "cond_hint": q_img.get("cond", "")}
-            knn_res = self._pred_compute_one(knn_t)
+            knn_res = self._pred_compute_one(knn_t, with_advanced=False)
         except Exception:
             knn_res = None
         finally:
@@ -9187,32 +9227,182 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                f"(uniform {opt['baseline_rmse']:.2f}d)"))
 
     def _adv_run(self):
-        """▶ Run Advanced Estimation 버튼 핸들러"""
-        # ── Evaluation 탭 결과 재사용 ────────────────────────
-        ctx = getattr(self, "_last_eval_ctx", None)
-        if ctx is None or ctx.get("target") is None:
-            self._adv_set_interp(
-                "⚠ 먼저 Evaluation 탭에서\n"
-                "▶ Run Evaluation을 실행한다.")
-            return
+        """▶ Run Advanced Estimation 버튼 핸들러.
 
-        target   = ctx["target"]
-        pool     = ctx.get("pool", [])
-        if not pool:
-            self._adv_set_interp("⚠ 참조 DB가 비어 있다.")
+        모든 평가대상에 대해 _pred_compute_one (5 methods + ensemble)
+        실행 후 Treeview 에 결과 표시. 첫 행 자동 선택 → detail 패널.
+        """
+        if not getattr(self, "_pred_targets", None):
+            self._adv_set_interp(
+                _L("⚠ 평가대상이 없습니다.\n"
+                   "Evaluation 탭에서 ➕ 추가 후 다시 시도하세요.",
+                   "⚠ No evaluation targets.\n"
+                   "Add targets in the Evaluation tab first."))
+            return
+        if not self.images:
+            self._adv_set_interp(
+                _L("⚠ 분석대상 이미지가 없습니다.\n"
+                   "DB 를 먼저 LOAD 하세요.",
+                   "⚠ No analyzed images. LOAD a DB first."))
             return
 
         self._adv_run_btn.configure(state="disabled", text="⏳ 계산 중...")
         self.update_idletasks()
 
         try:
-            self._adv_run_inner(target, pool, ctx)
+            # 평가대상마다 _pred_compute_one 호출 — result["adv"] 채워짐
+            n = len(self._pred_targets)
+            for i, t in enumerate(self._pred_targets):
+                self._set_status(
+                    _L(f"🧪 Advanced: {i+1}/{n} {t.get('name','')[:30]}",
+                       f"🧪 Advanced: {i+1}/{n} {t.get('name','')[:30]}"))
+                self.update_idletasks()
+                try:
+                    res = self._pred_compute_one(t)
+                    if res is not None:
+                        t["result"] = res
+                except Exception as ex:
+                    print(f"[adv-run] target {t.get('name','?')} failed: "
+                          f"{type(ex).__name__}: {ex}")
+
+            # Treeview 채우기
+            self._adv_populate_tree()
+
+            # 첫 행 자동 선택 → detail 갱신
+            kids = self._adv_tv.get_children()
+            if kids:
+                self._adv_tv.selection_set(kids[0])
+                self._adv_tv.focus(kids[0])
+            else:
+                self._adv_set_interp(
+                    _L("⚠ 분석 가능한 평가대상이 없습니다.",
+                       "⚠ No analyzable targets."))
+
+            self._set_status(
+                _L(f"✓ Advanced 분석 완료: {n}개 평가대상",
+                   f"✓ Advanced complete: {n} targets"))
         except Exception as ex:
             import traceback
             self._adv_set_interp(f"❌ 오류:\n{traceback.format_exc()}")
         finally:
             self._adv_run_btn.configure(state="normal",
                                          text="▶ Run Advanced Estimation")
+
+    def _adv_populate_tree(self):
+        """Treeview 에 self._pred_targets 의 advanced 결과 행 채우기."""
+        # 기존 행 제거
+        for iid in self._adv_tv.get_children():
+            self._adv_tv.delete(iid)
+        self._adv_tv_tid = {}
+
+        for idx, t in enumerate(self._pred_targets, 1):
+            res = t.get("result") or {}
+            adv = res.get("adv") or {}
+            nm = (t.get("name", "") or f"T{idx}")[:18]
+            cnd = (t.get("cond_hint")
+                   or t.get("cond")
+                   or "")[:14]
+            day_str = str(t.get("day", "") or "")
+            ens_d = adv.get("ens_day")
+            ens_c = adv.get("ens_conf")
+            ens_str = f"{ens_d:.1f}" if ens_d is not None else "-"
+            conf_str = f"{ens_c:.0f}" if ens_c is not None else "-"
+            iid = self._adv_tv.insert(
+                "", "end",
+                values=(nm, cnd, day_str, ens_str, conf_str))
+            self._adv_tv_tid[iid] = t.get("tid")
+
+    def _adv_on_target_select(self, event=None):
+        """Treeview 선택 → 선택된 평가대상의 detail 패널 갱신."""
+        sel = self._adv_tv.selection()
+        if not sel:
+            return
+        tid = self._adv_tv_tid.get(sel[0])
+        if tid is None:
+            return
+        t = next((x for x in self._pred_targets
+                  if x.get("tid") == tid), None)
+        if t is None:
+            return
+        self._adv_show_for_target(t)
+
+    def _adv_show_for_target(self, t: dict):
+        """선택된 평가대상의 5 methods + ensemble + 가중치 + 해석 표시."""
+        res = t.get("result") or {}
+        adv = res.get("adv")
+
+        def fmt(d, c):
+            if d is None:
+                return _L("추정 불가", "N/A")
+            return f"{d:.1f}일  ({c:.0f}%)" if (lambda: True)() else f"{d:.1f}d ({c:.0f}%)"
+
+        if adv is None:
+            for k in ("knn", "wass", "fft", "spatial", "kinetic", "ens"):
+                self._adv_result_vars[k].set("—")
+            for w in self._adv_weight_frame.winfo_children():
+                w.destroy()
+            self._adv_set_interp(
+                _L("이 평가대상의 advanced 결과가 없습니다.\n"
+                   "▶ Run Advanced Estimation 다시 실행.",
+                   "No advanced result for this target.\nRe-run."))
+            return
+
+        knn_d, knn_c = adv["knn"]
+        wass_d, wass_c = adv["wass"]
+        fft_d, fft_c = adv["fft"]
+        spatial_d, spatial_c = adv["spatial"]
+        kinetic_d, kinetic_c = adv["kinetic"]
+        ens_d = adv.get("ens_day")
+        ens_c = adv.get("ens_conf", 0)
+        weights = adv.get("weights", {})
+
+        self._adv_result_vars["knn"    ].set(fmt(knn_d,     knn_c))
+        self._adv_result_vars["wass"   ].set(fmt(wass_d,    wass_c))
+        self._adv_result_vars["fft"    ].set(fmt(fft_d,     fft_c))
+        self._adv_result_vars["spatial"].set(fmt(spatial_d, spatial_c))
+        self._adv_result_vars["kinetic"].set(fmt(kinetic_d, kinetic_c))
+        self._adv_result_vars["ens"    ].set(fmt(ens_d,     ens_c))
+
+        # 가중치 바
+        for w in self._adv_weight_frame.winfo_children():
+            w.destroy()
+        for name, color in [("knn",     "#4f8ef7"),
+                             ("wass",    "#22c55e"),
+                             ("fft",     "#fbbf24"),
+                             ("spatial", "#f97316"),
+                             ("kinetic", "#a78bfa")]:
+            wv = weights.get(name, 0)
+            rf = tk.Frame(self._adv_weight_frame, bg=PANEL)
+            rf.pack(fill="x", pady=1)
+            tk.Label(rf, text=f"{name[:7]:7s}", bg=PANEL,
+                     fg=color, font=LF, width=8).pack(side="left")
+            bar_bg = tk.Frame(rf, bg=CARD2, height=8)
+            bar_bg.pack(side="left", fill="x", expand=True)
+            bar_bg.update_idletasks()
+            bar_w = max(2, int(bar_bg.winfo_width() * wv))
+            tk.Frame(bar_bg, bg=color, height=8,
+                     width=bar_w).place(x=0, y=0)
+            tk.Label(rf, text=f"{wv*100:.0f}%", bg=PANEL,
+                     fg=SUB, font=LF, width=4).pack(side="right")
+
+        # 해석 텍스트 — 평가대상 메타 + 결과 요약
+        nm = t.get("name", "")
+        cnd = t.get("cond_hint") or t.get("cond") or "-"
+        day_str = str(t.get("day", "") or "-")
+        roi = t.get("roi") or (None,)*4
+        roi_str = (f"{roi[0]},{roi[1]} - {roi[2]},{roi[3]}"
+                   if all(v is not None for v in roi[:4]) else "-")
+        interp = (
+            f"📷 {nm}\n"
+            f"   조건: {cnd}    Day: {day_str}\n"
+            f"   ROI:  {roi_str}\n\n"
+            f"5개 방법 추정값 (위 표 참조)\n"
+            f"앙상블: {fmt(ens_d, ens_c)}\n\n"
+            f"가중치 (저장된 adv_weights 적용 시):\n"
+            + "\n".join(f"  {n:<8s} {weights.get(n,0)*100:>5.1f}%"
+                        for n in ("knn","wass","fft","spatial","kinetic"))
+        )
+        self._adv_set_interp(interp)
 
     def _adv_run_inner(self, target: dict, pool: list, ctx: dict):
         """실제 연산 — 5가지 방법 + 앙상블"""
