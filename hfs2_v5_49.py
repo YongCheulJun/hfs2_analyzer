@@ -5490,12 +5490,12 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 # 평가 대상 (있으면 첫 파일에서만 — 누적 시 충돌 가능)
                 try:
                     import sqlite3 as _sq
-                    con = _db_open_safe(path)
+                    # read-only 로 열어 9p lock 회피. 마이그레이션은 SAVE 시점에만.
+                    con = _db_open_read(path)
                     cur = con.execute(
                         "SELECT name FROM sqlite_master "
                         "WHERE type='table' AND name='eval_target'")
                     if cur.fetchone():
-                        _migrate_eval_target_schema(con)
                         rows = list(con.execute(
                             "SELECT target_id, name, rgb_blob, roi, "
                             "color, cond_hint "
@@ -5676,17 +5676,17 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         return n_loaded
 
     def _db_load_target(self, path: str):
-        """평가 대상 이미지 로드 (내부 공용 — 다중 target)"""
+        """평가 대상 이미지 로드 (내부 공용 — 다중 target). read-only."""
         try:
             import sqlite3 as _sq
-            con = _db_open_safe(path)
+            # read-only — 9p lock 회피. 마이그레이션은 SAVE 시점에만.
+            con = _db_open_read(path)
             cur = con.execute(
                 "SELECT name FROM sqlite_master "
                 "WHERE type='table' AND name='eval_target'")
             if not cur.fetchone():
                 con.close()
                 return False
-            _migrate_eval_target_schema(con)
             rows = list(con.execute(
                 "SELECT target_id, name, rgb_blob, roi, "
                 "color, cond_hint "
