@@ -1537,8 +1537,10 @@ def db_save_all(path: str, images: list) -> int:
     저장된 행 수 반환.
     """
     saveable = [img for img in images if img.get("rgb") is not None]
+    n_with_raman = sum(1 for img in saveable
+                       if img.get("raman_id") is not None)
     print(f"[db-save-all] start: path={path} total_images={len(images)} "
-          f"saveable={len(saveable)}")
+          f"saveable={len(saveable)} with_raman_id={n_with_raman}")
     if not saveable:
         print(f"[db-save-all] WARN: no saveable images (all rgb is None)")
         return 0
@@ -1693,6 +1695,7 @@ def db_load_all(path: str) -> list:
     cols = [r[1] for r in con.execute("PRAGMA table_info(images)").fetchall()]
     has_raman_col = "raman_id" in cols
     select_raman = "raman_id" if has_raman_col else "NULL AS raman_id"
+    print(f"[db-load-all] path={path} raman_id_col={has_raman_col}")
     rows = con.execute(f"""
         SELECT name, day, cond,
                roi_x0, roi_y0, roi_x1, roi_y1,
@@ -1702,6 +1705,8 @@ def db_load_all(path: str) -> list:
                stats_json, rgb_blob, thumb_blob, {select_raman}, saved_at
         FROM images ORDER BY cond, CAST(day AS REAL)
     """).fetchall()
+    n_with_raman = sum(1 for r in rows if r[21] is not None)
+    print(f"[db-load-all] rows={len(rows)} with_raman_id={n_with_raman}")
     con.close()
 
     result = []
@@ -1759,11 +1764,13 @@ def db_load_raman_all(path: str) -> list:
                 "SELECT name FROM sqlite_master "
                 "WHERE type='table' AND name='raman_data'")
             if not cur.fetchone():
+                print(f"[db-load-raman-all] no raman_data table in {path}")
                 return out
             rows = con.execute(
                 "SELECT id, cond, day, peak, norm_peak, peak_shift, "
                 "peak_range, spectrum_json FROM raman_data ORDER BY id"
             ).fetchall()
+            print(f"[db-load-raman-all] {path} rows={len(rows)}")
             for (rid, cond, day, peak, norm_peak,
                  peak_shift, peak_range, spec_j) in rows:
                 spec = _json.loads(spec_j) if spec_j else None
@@ -5328,8 +5335,11 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 self._ensure_raman_ids()
             n_raman_local = (len(self._raman_data)
                              if hasattr(self, "_raman_data") else 0)
+            n_img_linked = sum(1 for img in self.images
+                               if img.get("raman_id") is not None)
             print(f"[_db_save] step 0: raman _id ensured "
-                  f"(raman_entries={n_raman_local})")
+                  f"(raman_entries={n_raman_local} "
+                  f"images_linked={n_img_linked})")
 
             print(f"[_db_save] step 1: db_save_all -> tmp")
             n = db_save_all(tmp_path, self.images)
