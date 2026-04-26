@@ -3199,11 +3199,14 @@ class App(_Base):
                 + _group_table(list(raman_data or []), title_r, "cond", "day"))
 
     def _report_pred_targets_detail_html(self, pred_targets,
-                                         eval_ctx, KO=False) -> str:
+                                         eval_ctx, KO=False,
+                                         chart_b64=None) -> str:
         """리포트 6.x — 평가대상별 상세 정보 (cond, day, ROI, 분석 결과).
 
         eval_ctx 는 단일 활성 평가대상 결과만 보유 — 각 평가대상 카드의
         분석 결과는 self._pred_targets[i].get("result") 에서 가져옴.
+        chart_b64 가 주어지면 'stage_t<idx>' 키의 stage similarity
+        이미지를 표 아래에 그리드로 표시.
         """
         if not pred_targets:
             msg = ("평가 대상 이미지가 없다." if KO
@@ -3272,9 +3275,38 @@ class App(_Base):
             tds = "".join(f"<td>{c}</td>" for c in row)
             rows_html += f"<tr style='background:{bg}'>{tds}</tr>"
         ths_html = "".join(f"<th>{h}</th>" for h in hdrs)
-        return ("<table><thead><tr>" + ths_html
-                + "</tr></thead><tbody>" + rows_html
-                + "</tbody></table>")
+        table_html = ("<table><thead><tr>" + ths_html
+                      + "</tr></thead><tbody>" + rows_html
+                      + "</tbody></table>")
+
+        # 평가대상별 Stage Similarity 차트 그리드
+        stage_grid = ""
+        if chart_b64:
+            chart_items = []
+            for idx, t in enumerate(pred_targets, 1):
+                key = f"stage_t{idx}"
+                b64 = chart_b64.get(key)
+                if not b64:
+                    continue
+                cap = (f"#{idx}  {_esc(t.get('name', '')[:32])}"
+                       f"  ({_esc(t.get('cond_hint') or t.get('cond') or '')})")
+                chart_items.append(
+                    "<div style='flex:0 0 48%;margin:6px 0;"
+                    "background:#fff;border:1px solid #dde3f0;"
+                    "border-radius:6px;padding:8px;'>"
+                    f"<img src='data:image/png;base64,{b64}' "
+                    "style='width:100%;display:block;border-radius:4px;'>"
+                    f"<div style='font-size:10px;color:#555;"
+                    f"text-align:center;margin-top:4px;'>{cap}</div>"
+                    "</div>")
+            if chart_items:
+                title = ("Stage Similarity 차트 (평가대상별)" if KO
+                         else "Stage Similarity Charts (per target)")
+                stage_grid = (f"<h4 style='margin-top:18px'>{title}</h4>"
+                              "<div style='display:flex;flex-wrap:wrap;"
+                              "gap:1.5%;'>" + "".join(chart_items)
+                              + "</div>")
+        return table_html + stage_grid
 
     def _generate_report(self):
         """보고서 생성 — 영문/한글 동시, 워드(.docx) 또는 HTML 선택"""
@@ -3390,6 +3422,19 @@ class App(_Base):
                 if fig: chart_figs[k] = fig
             for k, cell in getattr(self, "_raman_charts", {}).items():
                 if cell.get("fig"): chart_figs[k] = cell["fig"]
+
+            # 평가대상별 Stage Similarity 차트 — chart_b64 에 stage_t<idx> 키
+            for idx, t in enumerate(getattr(self, "_pred_targets", []) or [],
+                                    start=1):
+                try:
+                    fig = self._make_stage_figure(
+                        t, figsize=(5.0, 1.8), dpi=140)
+                except Exception as ex:
+                    print(f"[report-stage] target {idx}: "
+                          f"{type(ex).__name__}: {ex}")
+                    fig = None
+                if fig is not None:
+                    chart_figs[f"stage_t{idx}"] = fig
 
             for k, fig in chart_figs.items():
                 try:
@@ -4997,9 +5042,9 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         # 4. 데이터셋 요약 (분석/평가/라만 cond·day·갯수)
         dset_html = self._report_dataset_summary_html(
             images, raman_data, pred_targets, KO=KO)
-        # 7.1 평가 대상 상세
+        # 7.1 평가 대상 상세 (+ 평가대상별 stage similarity 차트)
         pred_detail = self._report_pred_targets_detail_html(
-            pred_targets, eval_ctx, KO=KO)
+            pred_targets, eval_ctx, KO=KO, chart_b64=chart_b64)
 
         return (
             "<!DOCTYPE html>\n<html lang=\"" + ("ko" if KO else "en") + "\">\n<head>\n"
@@ -5618,6 +5663,21 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                     fv(conf, 0) if conf is not None else "-",
                 ])
             add_tbl(p_h, p_r)
+
+            # 평가대상별 stage similarity 차트
+            if chart_b64:
+                ah(("평가대상별 Stage Similarity 차트" if KO
+                    else "Stage Similarity Charts (per target)"),
+                   level=3)
+                for i, t in enumerate(pred_targets, 1):
+                    key = f"stage_t{i}"
+                    b64 = chart_b64.get(key)
+                    if not b64:
+                        continue
+                    cap = (f"#{i} {t.get('name','')[:32]} "
+                           f"({t.get('cond_hint') or t.get('cond') or ''})")
+                    ap(cap, bold=True, size=9)
+                    add_img(b64, width=5.5)
 
         ah("8. 차트 해석 가이드 (Chart Interpretation Guide)" if KO
            else "8. Chart Interpretation Guide")
@@ -9668,27 +9728,20 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             return
         self._adv_show_for_target(t)
 
-    def _adv_draw_stage_chart(self, t: dict):
-        """선택된 평가대상의 stage similarity 차트 (3 막대 + best 강조).
+    def _make_stage_figure(self, t: dict, figsize=(3.4, 1.4),
+                            dpi: int = 96, fontsize: int = 6,
+                            facecolor=None):
+        """평가대상의 stage similarity matplotlib Figure 반환 (canvas 무관).
 
-        x축 = early/mid/late, y축 = 정규화 거리 (낮을수록 가까움).
-        best_stage 는 색 강조 + ★ 마커.
+        Tk canvas 임베드(_adv_draw_stage_chart) 와 리포트 PNG 변환
+        (_generate_report) 양쪽에서 재사용.
         """
-        # 기존 캔버스 제거
-        old = self._adv_stage_canvas
-        if old is not None:
-            try: old.get_tk_widget().destroy()
-            except Exception: pass
-            self._adv_stage_canvas = None
-
+        if facecolor is None:
+            facecolor = PANEL
         res = t.get("result") or {}
         stage = res.get("stage")
         if not stage or not stage.get("distances"):
-            tk.Label(self._adv_stage_frame,
-                     text=_L("(stage 데이터 없음)",
-                             "(no stage data)"),
-                     bg=CARD, fg=SUB, font=LF).pack(expand=True)
-            return
+            return None
 
         dists = stage["distances"]
         best  = stage.get("best_stage")
@@ -9696,7 +9749,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         labels_kr = {"early": "초기", "mid": "중기", "late": "말기"}
         order = [s for s in ("early", "mid", "late") if s in dists]
         if not order:
-            return
+            return None
         ys = [dists[s] for s in order]
         xs_lbl = [f"{labels_kr.get(s, s)}\n"
                   f"d{sigs.get(s, {}).get('day_range', ('?','?'))[0]}-"
@@ -9706,32 +9759,60 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         if best in order:
             colors[order.index(best)] = "#22c55e"
 
-        fig = plt.Figure(figsize=(3.4, 1.4), dpi=96, facecolor=PANEL)
+        fig = plt.Figure(figsize=figsize, dpi=dpi, facecolor=facecolor)
         ax = fig.add_subplot(111)
         styled_ax(ax)
         bars = ax.bar(range(len(order)), ys, color=colors,
                       edgecolor="white", linewidth=0.6)
         ax.set_xticks(range(len(order)))
-        ax.set_xticklabels(xs_lbl, fontsize=6)
-        ax.tick_params(axis="y", labelsize=6)
+        ax.set_xticklabels(xs_lbl, fontsize=fontsize)
+        ax.tick_params(axis="y", labelsize=fontsize)
         ax.set_ylabel(_L("거리(낮을수록 가까움)",
                          "Distance (lower = closer)"),
-                      fontsize=6, color=SUB)
-        # best 위에 ★
+                      fontsize=fontsize, color=SUB)
         if best in order:
             i = order.index(best)
             ax.text(i, ys[i], "★", ha="center", va="bottom",
-                    fontsize=11, color="#16a34a", fontweight="bold")
+                    fontsize=fontsize + 5, color="#16a34a",
+                    fontweight="bold")
         for i, b in enumerate(bars):
             ax.text(b.get_x() + b.get_width()/2, b.get_height(),
                     f"{ys[i]:.2f}", ha="center", va="bottom",
-                    fontsize=6, color=SUB)
-        # Al2O3 등 low_time_res 면 차트 제목에 경고
-        title = _L("Stage Similarity", "Stage Similarity")
+                    fontsize=fontsize, color=SUB)
+        title_parts = []
+        nm = (t.get("name") or "")[:32]
+        cnd = t.get("cond_hint") or t.get("cond") or ""
+        if nm or cnd:
+            title_parts.append(f"{nm}  ({cnd})")
+        title_parts.append(_L("Stage Similarity",
+                              "Stage Similarity"))
         if res.get("low_time_res"):
-            title += _L("  ⚠ 정확도 한계", "  ⚠ limited")
-        ax.set_title(title, fontsize=7, color=TXT)
+            title_parts.append(_L("⚠ 정확도 한계", "⚠ limited"))
+        ax.set_title("  ".join(title_parts),
+                     fontsize=fontsize + 1, color=TXT)
         fig.tight_layout(pad=0.3)
+        return fig
+
+    def _adv_draw_stage_chart(self, t: dict):
+        """선택된 평가대상의 stage similarity 차트를 Tk canvas 에 임베드."""
+        # 기존 캔버스 제거
+        old = self._adv_stage_canvas
+        if old is not None:
+            try: old.get_tk_widget().destroy()
+            except Exception: pass
+            self._adv_stage_canvas = None
+        # 빈 라벨 제거 (이전 호출의 placeholder 포함)
+        for w in self._adv_stage_frame.winfo_children():
+            try: w.destroy()
+            except Exception: pass
+
+        fig = self._make_stage_figure(t)
+        if fig is None:
+            tk.Label(self._adv_stage_frame,
+                     text=_L("(stage 데이터 없음)",
+                             "(no stage data)"),
+                     bg=CARD, fg=SUB, font=LF).pack(expand=True)
+            return
 
         cv = FigureCanvasTkAgg(fig, master=self._adv_stage_frame)
         cv.get_tk_widget().pack(fill="both", expand=True)
