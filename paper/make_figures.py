@@ -55,26 +55,46 @@ plt.rcParams.update({
 
 
 # ──────────────────────────────────────────────────────────────────
+SAMPLE_DIR = os.path.join(ROOT, "newfiles/output/sample")
+
+
 def fig1_specimen_mosaic():
-    """4 cond × 3 day timeline 시편 사진."""
-    days_show = [0, 7, 14, 28]
+    """4 cond × 5 day timeline 시편 사진 (sample/*.jpg 사용).
+
+    sample/ 폴더 구성: <day>day_<RH>RH_<cond>.jpg, day ∈ {0,3,7,14,28},
+    4 cond → 20 장. 파일명에서 날짜/조건 파싱해 누락 없이 mosaic.
+    """
+    import re as _re
+    days_show = [0, 3, 7, 14, 28]
+    # 파일명 → (day, rh, cond_token) 인덱스
+    files = sorted(os.listdir(SAMPLE_DIR))
+    idx = {}
+    for f in files:
+        m = _re.match(r'(\d+)day_(\d+)RH_(\S+?)\.(jpg|jpeg|png)$', f,
+                      _re.IGNORECASE)
+        if not m: continue
+        d_, rh_, tok_, _ = m.groups()
+        idx[(int(d_), rh_, tok_.upper())] = f
+
     fig, axes = plt.subplots(len(CONDS), len(days_show),
-                              figsize=(7.0, 7.2))
-    fig.subplots_adjust(left=0.13, right=0.99, top=0.96, bottom=0.02,
-                         wspace=0.05, hspace=0.05)
+                              figsize=(7.4, 6.4))
+    fig.subplots_adjust(left=0.14, right=0.99, top=0.95, bottom=0.02,
+                         wspace=0.04, hspace=0.05)
     for r, cond in enumerate(CONDS):
+        rh = "35" if "35%" in cond else "70"
+        if "Al2O3" in cond:
+            tok = "AL2O3HFS2"
+        elif "PMMA" in cond:
+            tok = "PMMA_HFS2"
+        else:
+            tok = "NATIVEHFS2"
         for c, d in enumerate(days_show):
             ax = axes[r, c]
             ax.set_xticks([]); ax.set_yticks([])
             for sp in ax.spines.values(): sp.set_color("#222")
-            # try output_cut/<day>day_<rh>RH_<cond>.png patterns
-            rh = "35" if "35%" in cond else "70"
-            cond_short = "NativeHFS2" if "Native" in cond else (
-                "Al2O3HFS2" if "Al2O3" in cond else "PMMA_HFS2")
-            fname = f"{d}day_{rh}RH_{cond_short}.png"
-            path = os.path.join(OUTCUT, fname)
-            if os.path.exists(path):
-                img = mpimg.imread(path)
+            f = idx.get((d, rh, tok))
+            if f:
+                img = mpimg.imread(os.path.join(SAMPLE_DIR, f))
                 ax.imshow(img)
             else:
                 ax.set_facecolor("#f0f0f0")
@@ -82,9 +102,9 @@ def fig1_specimen_mosaic():
                         fontsize=7, color="#888",
                         transform=ax.transAxes)
             if r == 0:
-                ax.set_title(f"Day {d}", fontsize=9)
+                ax.set_title(f"Day {d}", fontsize=10, pad=2)
             if c == 0:
-                ax.set_ylabel(COND_LABEL[cond], fontsize=8.5,
+                ax.set_ylabel(COND_LABEL[cond], fontsize=9,
                               rotation=90, labelpad=4)
     plt.savefig(os.path.join(FIG_DIR, "fig1_specimen.png"))
     plt.close(fig)
@@ -205,7 +225,9 @@ def fig4_method_rmse():
     }
     method_colors = ["#2563eb", "#16a34a", "#fbbf24", "#f97316",
                      "#a855f7", "#94a3b8", "#dc2626"]
-    fig, ax = plt.subplots(figsize=(7.0, 3.0))
+    # 우측에 범례를 위치시키기 위해 figure 폭 + axes 영역 분리
+    fig, ax = plt.subplots(figsize=(7.4, 3.0))
+    plt.subplots_adjust(left=0.08, right=0.78, top=0.88, bottom=0.18)
     x = np.arange(len(cond_labels))
     width = 0.11
     for i, m in enumerate(methods):
@@ -216,12 +238,14 @@ def fig4_method_rmse():
     ax.set_xticklabels(cond_labels, fontsize=7.5)
     ax.set_ylabel("RMSE (days)", fontsize=8.5)
     ax.set_title("Per-condition RMSE: individual methods vs. ensemble",
-                 fontsize=9, fontweight="bold")
-    ax.legend(ncol=4, fontsize=7, loc="upper left",
-              bbox_to_anchor=(0.0, 1.18), frameon=False)
+                 fontsize=9, fontweight="bold", pad=6)
+    # 범례 — axes 우측 외부 (제목과 절대 겹치지 않음)
+    ax.legend(ncol=1, fontsize=7, loc="upper left",
+              bbox_to_anchor=(1.02, 1.0), frameon=False,
+              handlelength=1.2, handletextpad=0.5,
+              borderaxespad=0)
     ax.grid(True, axis="y", ls=":", lw=0.4, alpha=0.5)
     ax.set_ylim(0, 30)
-    plt.subplots_adjust(top=0.78)
     plt.savefig(os.path.join(FIG_DIR, "fig4_method_rmse.png"),
                 bbox_inches="tight")
     plt.close(fig)

@@ -513,12 +513,64 @@ P("We have demonstrated that a single specimen photograph, processed "
   align="justify", after=10)
 
 
-# ─────────────────── ACKNOWLEDGEMENTS ───────────────────
-H("Acknowledgements", level=1, size=11, bold=True)
-P("This work was supported by the National Research Foundation of "
-  "Korea (NRF) under the program of Jeonbuk National University. "
-  "The authors thank the members of the Park Group for assistance "
-  "with sample preparation and Raman measurement.",
+# ─── Supplementary Materials (MDPI 표준 섹션) ───
+H("Supplementary Materials", level=1, size=11, bold=True)
+P("The following supporting information is provided as a separate "
+  "document (Jun_HfS2_image_oxidation_SI.docx): "
+  "Figure S1 — full 33-image specimen mosaic (output_cut/) used as the "
+  "leave-one-out evaluation set; "
+  "Figure S2 — automatic ROI overlays demonstrating the HSV/convex-hull "
+  "extraction across the four passivation conditions; "
+  "Figure S3 — true-vs-predicted scatter of each individual estimator "
+  "(KNN, Wasserstein, FFT, spatial, kinetic); "
+  "Figure S4 — heatmap of the condition-specific ensemble weights "
+  "learned by Huber-loss optimisation; "
+  "Figure S5 — pseudo-Raman estimates for the three additional "
+  "conditions (Native HfS₂ at 35% RH, 70% RH, and PMMA/HfS₂); "
+  "Table S1 — per-target leave-one-out predictions of all 33 query "
+  "images for the five individual estimators and the two ensemble "
+  "configurations; "
+  "Table S2 — full condition × method weight matrix; "
+  "Table S3 — Pearson correlation r(day, metric) for each condition.",
+  align="justify", after=8)
+
+# ─── Author Contributions (MDPI 표준) ───
+H("Author Contributions", level=1, size=11, bold=True)
+P("Conceptualization, Y.J. and K.P.; methodology, Y.J.; software, "
+  "Y.J.; validation, Y.J. and K.P.; formal analysis, Y.J.; "
+  "investigation, Y.J. and K.P.; resources, K.P.; data curation, "
+  "Y.J.; writing — original draft preparation, Y.J.; writing — review "
+  "and editing, K.P.; visualization, Y.J.; supervision, K.P.; "
+  "project administration, K.P.; funding acquisition, K.P. "
+  "All authors have read and agreed to the published version of "
+  "the manuscript.", align="justify", after=6)
+
+# ─── Funding ───
+H("Funding", level=1, size=11, bold=True)
+P("This research was funded by the National Research Foundation of "
+  "Korea (NRF) under the program of Jeonbuk National University.",
+  align="justify", after=6)
+
+# ─── Data Availability ───
+H("Data Availability Statement", level=1, size=11, bold=True)
+P("The image dataset (output_cut/, sample/), the unified analysis "
+  "database (alldata.db) and the Raman reference database "
+  "(raman.raman.db) supporting the findings of this study are "
+  "available from the corresponding author upon reasonable request. "
+  "The image-processing pipeline source code is openly available at "
+  "https://github.com/YongCheulJun/hfs2_analyzer.",
+  align="justify", after=6)
+
+# ─── Acknowledgments ───
+H("Acknowledgments", level=1, size=11, bold=True)
+P("The authors thank the members of the Park Group at Jeonbuk "
+  "National University for assistance with sample preparation, Raman "
+  "measurement, and helpful discussions.",
+  align="justify", after=6)
+
+# ─── Conflicts of Interest ───
+H("Conflicts of Interest", level=1, size=11, bold=True)
+P("The authors declare no conflicts of interest.",
   align="justify", after=10)
 
 
