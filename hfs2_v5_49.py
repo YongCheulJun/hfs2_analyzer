@@ -16,7 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 import re as _re
 import numpy as np
 from PIL import Image, ImageTk, ImageDraw
-import cv2, os, csv, io, datetime, glob, json, base64, subprocess
+import cv2, os, csv, io, datetime, glob, json, base64, subprocess, traceback, tempfile, shutil
 import matplotlib
 # ★ TkAgg 백엔드: FigureCanvasTkAgg와 매칭. "Agg"는 화면 렌더링이 안 되는
 #   파일 전용 백엔드라 tkinter 팝업에서 빈 화면으로 나타남.
@@ -1319,10 +1319,25 @@ def _db_open_safe(path: str, timeout: float = 15.0) -> sqlite3.Connection:
     유발 → 안전한 DELETE 모드 (기본 rollback journal) 사용.
     busy_timeout 으로 OS-레벨 lock 도 15초까지 대기.
     """
-    con = sqlite3.connect(path, timeout=timeout)
-    con.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
-    con.execute("PRAGMA journal_mode=DELETE")
-    con.execute("PRAGMA synchronous=NORMAL")
+    pre_size = os.path.getsize(path) if os.path.exists(path) else -1
+    leftovers = [ext for ext in ("-wal", "-shm", "-journal")
+                 if os.path.exists(path + ext)]
+    print(f"[db-open] path={path} pre_size={pre_size} leftovers={leftovers}")
+    try:
+        con = sqlite3.connect(path, timeout=timeout)
+    except Exception as e:
+        print(f"[db-open] FAIL connect: {type(e).__name__}: {e}")
+        raise
+    try:
+        con.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+        jm = con.execute("PRAGMA journal_mode=DELETE").fetchone()
+        sync = con.execute("PRAGMA synchronous=NORMAL").fetchone()
+        print(f"[db-open] ok: journal_mode={jm} synchronous={sync}")
+    except Exception as e:
+        print(f"[db-open] FAIL pragma: {type(e).__name__}: {e}")
+        try: con.close()
+        except Exception: pass
+        raise
     return con
 
 
@@ -1428,10 +1443,14 @@ def db_save_all(path: str, images: list) -> int:
     저장된 행 수 반환.
     """
     saveable = [img for img in images if img.get("rgb") is not None]
+    print(f"[db-save-all] start: path={path} total_images={len(images)} "
+          f"saveable={len(saveable)}")
     if not saveable:
+        print(f"[db-save-all] WARN: no saveable images (all rgb is None)")
         return 0
 
     con = db_init(path)
+    print(f"[db-save-all] db_init ok, file_size={os.path.getsize(path)}")
     count = 0
     for img in saveable:
         roi = img.get("roi")
@@ -1476,8 +1495,20 @@ def db_save_all(path: str, images: list) -> int:
         ))
         count += 1
 
-    con.commit()
-    con.close()
+    print(f"[db-save-all] inserts done: count={count}, committing...")
+    try:
+        con.commit()
+    except Exception as e:
+        print(f"[db-save-all] FAIL commit: {type(e).__name__}: {e}")
+        try: con.close()
+        except Exception: pass
+        raise
+    try:
+        con.close()
+    except Exception as e:
+        print(f"[db-save-all] WARN close: {type(e).__name__}: {e}")
+    final_size = os.path.getsize(path) if os.path.exists(path) else -1
+    print(f"[db-save-all] ok: count={count} file_size={final_size}")
     return count
 
 
@@ -4995,24 +5026,36 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             filetypes=[("HfS2 DB","*.db"),("All","*.*")])
         if not path: return
 
-        # Atomic write: 임시 파일에 저장 후 os.replace 로 교체
-        # → 기존 lock/잔재 파일과 충돌 없음
-        tmp_path = path + ".tmp_save"
-        # 잔재 .tmp_save 정리
-        for ext in ("", "-wal", "-shm", "-journal"):
-            try: os.remove(tmp_path + ext)
-            except OSError: pass
+        # SQLite 작업은 OS local temp 디렉토리에서 수행 → \\wsl$ 9p 마운트의
+        # SQLite lock 충돌 회피. 완성된 DB 파일만 마지막에 dst 로 shutil.move.
+        tmp_dir = tempfile.mkdtemp(prefix="hfs2_save_")
+        tmp_path = os.path.join(tmp_dir, "save.db")
+        dst_pre_size = os.path.getsize(path) if os.path.exists(path) else -1
+        dst_leftovers = [ext for ext in ("-wal", "-shm", "-journal")
+                         if os.path.exists(path + ext)]
+        print(f"[_db_save] === START ===")
+        print(f"[_db_save] dst path={path} pre_size={dst_pre_size} "
+              f"leftovers={dst_leftovers}")
+        print(f"[_db_save] tmp path={tmp_path} (local temp dir)")
+        print(f"[_db_save] images={len(self.images)} analyzed={analyzed_n} "
+              f"eval_targets={len(self._pred_targets) if hasattr(self, '_pred_targets') and self._pred_targets else 0}")
 
         try:
+            print(f"[_db_save] step 1: db_save_all -> tmp")
             n = db_save_all(tmp_path, self.images)
+            tmp_size_after_imgs = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else -1
+            print(f"[_db_save] step 1 ok: n={n} tmp_size={tmp_size_after_imgs}")
+
             # 평가 대상 + backup 정리를 단일 connection 으로 통합
             eval_note = ""
             import pickle as _pk, json as _js
+            print(f"[_db_save] step 2: open tmp for eval_target")
             con = _db_open_safe(tmp_path)
             try:
                 if self._pred_targets:
                     _migrate_eval_target_schema(con)
                     con.execute("DELETE FROM eval_target")
+                    n_targets = 0
                     for t in self._pred_targets:
                         rgb = t.get("rgb")
                         if rgb is None:
@@ -5029,19 +5072,46 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                              t.get("color", ""),
                              t.get("cond_hint", ""),
                              None))
+                        n_targets += 1
                     eval_note = (f" + {len(self._pred_targets)} "
                                  "evaluation targets")
+                    print(f"[_db_save] step 2: inserted {n_targets} eval_targets")
+                else:
+                    print(f"[_db_save] step 2: no pred_targets, skipping inserts")
                 con.execute("DROP TABLE IF EXISTS eval_target_v1_backup")
                 con.commit()
+                print(f"[_db_save] step 2 ok: commit done")
             finally:
                 con.close()
+                print(f"[_db_save] step 2: connection closed")
 
-            # 기존 path 의 lock 잔재 정리 (있으면)
-            for ext in ("-wal", "-shm", "-journal"):
-                try: os.remove(path + ext)
-                except OSError: pass
-            # Atomic rename (Windows/Linux 모두 atomic)
-            os.replace(tmp_path, path)
+            tmp_size_final = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else -1
+            print(f"[_db_save] step 3: prepare to move tmp -> dst, tmp_final_size={tmp_size_final}")
+            # 기존 path + lock 잔재 정리 (shutil.move 는 dst 가 있으면 실패할 수 있음)
+            for ext in ("", "-wal", "-shm", "-journal"):
+                target = path + ext
+                if os.path.exists(target):
+                    try:
+                        os.remove(target)
+                        print(f"[_db_save] cleaned dst: {target}")
+                    except OSError as e:
+                        print(f"[_db_save] WARN cannot remove dst {target}: {e}")
+            # Cross-fs safe move (local temp -> 9p / Windows / Linux 모두 OK)
+            print(f"[_db_save] step 3: shutil.move({tmp_path} -> {path})")
+            try:
+                shutil.move(tmp_path, path)
+            except Exception as e:
+                dst_now = os.path.getsize(path) if os.path.exists(path) else -1
+                tmp_now = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else -1
+                print(f"[_db_save] FAIL shutil.move: {type(e).__name__}: {e} "
+                      f"(tmp_size_now={tmp_now} dst_size_now={dst_now})")
+                raise
+            final_dst_size = os.path.getsize(path) if os.path.exists(path) else -1
+            print(f"[_db_save] === DONE === final dst_size={final_dst_size} records={n}")
+            # tmp_dir 정리
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception: pass
 
             unanalyzed = max(0, n - analyzed_n)
             ana_note = (f"  ({analyzed_n} analyzed, {unanalyzed} ROI-only)"
@@ -5051,10 +5121,17 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             self._set_status(
                 f"🗄 DB saved — {n} records{ana_note}  ({os.path.basename(path)})")
         except Exception as ex:
-            # 실패 시 .tmp_save 잔재 정리
-            for ext in ("", "-wal", "-shm", "-journal"):
-                try: os.remove(tmp_path + ext)
-                except OSError: pass
+            tmp_size_now = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else -1
+            dst_size_now = os.path.getsize(path) if os.path.exists(path) else -1
+            print(f"[_db_save] === FAILED === {type(ex).__name__}: {ex}")
+            print(f"[_db_save] state: tmp_size={tmp_size_now} dst_size={dst_size_now}")
+            traceback.print_exc()
+            # 실패 시 tmp_dir 통째로 정리
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                print(f"[_db_save] cleanup: removed tmp_dir {tmp_dir}")
+            except Exception as ce:
+                print(f"[_db_save] cleanup WARN: {ce}")
             err_msg = str(ex)
             if "locked" in err_msg.lower():
                 err_msg += _L(
