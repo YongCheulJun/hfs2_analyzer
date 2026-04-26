@@ -5248,6 +5248,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         if n_img > 0:
             if self.sel_idx < 0 and self.images:
                 self.sel_idx = 0
+            self._sort_images_by_cond_day()
             self._rebuild_list()
             self._refresh_orig()
             self._refresh_hsi()
@@ -5510,6 +5511,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
 
         if self.sel_idx < 0 and self.images:
             self.sel_idx = 0
+        self._sort_images_by_cond_day()
         self._rebuild_list()
         if total_eval > 0:
             self.after(150, self._pred_rebuild_cards)
@@ -14318,6 +14320,30 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
     # ─────────────────────────────────────────
     #  이미지 추가
     # ─────────────────────────────────────────
+    def _sort_images_by_cond_day(self):
+        """self.images 를 cond → day(숫자) → name 으로 정렬. sel_idx 보정.
+
+        이미지 추가/일괄 로드 후 호출 — 그래프 X축이 입력 순서가 아닌
+        실험 조건+날짜 순서로 그려지도록 보장.
+        """
+        if not self.images:
+            return
+        cur_obj = (self.images[self.sel_idx]
+                   if 0 <= self.sel_idx < len(self.images) else None)
+        def _key(img):
+            cond = (img.get("cond") or "").strip()
+            try:
+                day = float(img.get("day") or 9999)
+            except (ValueError, TypeError):
+                day = 9999.0
+            return (cond, day, img.get("name") or "")
+        self.images.sort(key=_key)
+        if cur_obj is not None:
+            try:
+                self.sel_idx = self.images.index(cur_obj)
+            except ValueError:
+                pass
+
     def _add_image(self, pil_img, name, defer_rebuild=False):
         """이미지 1장을 self.images 에 추가.
 
@@ -14354,6 +14380,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         if len(self.images)==1: self.sel_idx=0
         if defer_rebuild:
             return
+        self._sort_images_by_cond_day()
         self._rebuild_list()
         sym, ko, en = _ROI_FLAG_LABEL.get(roi_flag, ("•", roi_flag, roi_flag))
         self._set_status(
@@ -14427,6 +14454,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         if added > 0 and self.sel_idx < 0:
             self.sel_idx = 0
         if added > 0:
+            self._sort_images_by_cond_day()
             self._rebuild_list()
         return added, errors
 
