@@ -6922,6 +6922,43 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                                              "Estimated Spectrum + 95% CI"))
         self._pseudo_spec_cv = spec_cv2
 
+        # 차트 아래 상세 해석 텍스트 (스크롤 가능)
+        spec_desc_hdr = tk.Frame(spec_f, bg=PANEL2,
+                                  highlightbackground=BORDER,
+                                  highlightthickness=1)
+        spec_desc_hdr.pack(fill="x")
+        tk.Label(spec_desc_hdr,
+                 text=_L("  📖 그래프 해석 — 추정 스펙트럼",
+                         "  📖 Chart Interpretation — Estimated Spectrum"),
+                 bg=PANEL2, fg=TXT, font=LF).pack(
+                 side="left", padx=6, pady=2)
+        spec_desc_wrap = tk.Frame(spec_f, bg=CARD)
+        spec_desc_wrap.pack(fill="x", padx=2, pady=(0, 2))
+        spec_desc_sb = tk.Scrollbar(spec_desc_wrap)
+        spec_desc_sb.pack(side="right", fill="y")
+        self._pseudo_spec_desc = tk.Text(
+            spec_desc_wrap, wrap="word", height=12,
+            bg=CARD, fg=TXT,
+            font=("Consolas", 8),
+            relief="flat", padx=8, pady=6,
+            highlightthickness=0,
+            cursor="xterm",
+            yscrollcommand=spec_desc_sb.set,
+            state="disabled")
+        self._pseudo_spec_desc.pack(side="left", fill="both", expand=True)
+        spec_desc_sb.configure(command=self._pseudo_spec_desc.yview)
+        # 초기 안내
+        self._pseudo_spec_desc.configure(state="normal")
+        self._pseudo_spec_desc.insert(
+            "end",
+            _L("▶ Run Evaluation 을 실행하면 추정 스펙트럼의 상세 해석이 "
+               "여기에 표시됩니다. (그래프 구성요소, 추정 연산 순서, "
+               "산화 단계 판정, A₁g 강도, 95% 신뢰 구간, 라만 피크 참조값 등)",
+               "▶ Run Evaluation to populate detailed interpretation here "
+               "(chart components, estimation steps, oxidation stage, "
+               "A1g intensity, 95% CI, Raman peak reference values)."))
+        self._pseudo_spec_desc.configure(state="disabled")
+
         # 추정 결과 텍스트
         c_txt_hdr = tk.Frame(pC, bg=PANEL2,
                               highlightbackground=BORDER, highlightthickness=1)
@@ -8148,6 +8185,20 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         self._pseudo_spec_fig.patch.set_facecolor(PANEL)
         self._draw_pseudo_spec_fig(self._pseudo_spec_fig, target, large=False)
         self._pseudo_spec_cv.draw()
+
+        # 차트 아래 상세 해석 텍스트 갱신
+        if hasattr(self, "_pseudo_spec_desc"):
+            try:
+                ko = (hasattr(self, "_lang_var")
+                      and self._lang_var.get() == "ko")
+                desc = self._chart_desc_spectrum(ctx, ko=ko)
+            except Exception as ex:
+                desc = (f"(해석 텍스트 생성 실패: "
+                        f"{type(ex).__name__}: {ex})")
+            self._pseudo_spec_desc.configure(state="normal")
+            self._pseudo_spec_desc.delete("1.0", "end")
+            self._pseudo_spec_desc.insert("end", desc)
+            self._pseudo_spec_desc.configure(state="disabled")
 
         # ── 결과 텍스트 ────────────────────────────────
         def _oxid(peak):
