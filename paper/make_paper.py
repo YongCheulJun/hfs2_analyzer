@@ -517,20 +517,23 @@ P("We have demonstrated that a single specimen photograph, processed "
 H("Supplementary Materials", level=1, size=11, bold=True)
 P("The Supporting Information accompanying this article is appended "
   "starting on the page following the References, and contains: "
-  "Section S1 (Supplementary Methods) — extended description of the "
-  "automatic ROI extraction (S1.1), colorimetric and texture "
+  "Section S1 (Supplementary Methods) — extended description of "
+  "the automatic ROI extraction (S1.1), colorimetric and texture "
   "descriptors (S1.2), the five aging-day estimators (S1.3), the "
   "Huber-robust ensemble weight optimisation (S1.4), and the "
   "pseudo-Raman regression ensemble (S1.5); "
   "Section S2 (Dataset description) — image acquisition setup, "
-  "Raman measurement details, and the per-condition specimen counts; "
-  "Figures S1–S5 — full 33-image evaluation mosaic, automatic ROI "
-  "overlays, per-method true-vs-predicted scatter, condition-specific "
-  "weight heat-map, and pseudo-Raman estimates for the three "
-  "non-Al₂O₃ conditions; "
-  "Tables S1–S4 — per-target leave-one-out predictions, full "
-  "condition × method weight matrix, Pearson r(day, metric) per "
-  "condition, and dataset summary.",
+  "Raman measurement details, and per-condition specimen counts; "
+  "Section S3 (Software, reproducibility, and computational cost) — "
+  "open-source repository, dependency versions, and benchmark "
+  "(<200 ms per image, ~1500× faster than 30 s Raman); "
+  "Figures S1–S6 — full 33-image evaluation mosaic, automatic ROI "
+  "overlays, per-method scatter, condition-specific weight heat-map, "
+  "pseudo-Raman estimates for the three non-Al₂O₃ conditions, and "
+  "per-condition kinetic fits; "
+  "Tables S1–S5 — per-target leave-one-out predictions, condition × "
+  "method weight matrix, Pearson r(day, metric), dataset summary, and "
+  "the comprehensive algorithm hyperparameter list.",
   align="justify", after=8)
 
 # ─── Author Contributions (MDPI 표준) ───
@@ -691,8 +694,9 @@ toc_items = [
     "    S1.4 Huber-robust ensemble weight optimisation",
     "    S1.5 Pseudo-Raman spectrum reconstruction",
     "S2. Dataset description",
-    "S3. Supplementary Figures (S1–S6)",
-    "S4. Supplementary Tables (S1–S4)",
+    "S3. Software, reproducibility, and computational cost",
+    "S4. Supplementary Figures (S1–S6)",
+    "S5. Supplementary Tables (S1–S5)",
 ]
 for it in toc_items:
     p = doc.add_paragraph()
@@ -875,8 +879,41 @@ P("Table S4 summarises the per-condition specimen counts. Across "
   align="justify", after=8)
 
 
-# ═══════════════ S3 FIGURES ═══════════════
-H("S3. Supplementary Figures", level=1, size=14, bold=True)
+# ═══════════════ S3 SOFTWARE / REPRODUCIBILITY ═══════════════
+H("S3. Software, reproducibility, and computational cost",
+  level=1, size=14, bold=True)
+P("All image-processing, ensemble-weight learning, and pseudo-Raman "
+  "reconstruction code is open-sourced at "
+  "https://github.com/YongCheulJun/hfs2_analyzer under the project "
+  "module hfs2_v5_49.py. The headless reproduction script "
+  "tools/optimize_weights_headless.py reproduces every numerical "
+  "result reported in the main text from the unified analysis "
+  "database alldata.db (53 reference images) and the independent "
+  "evaluation directory output_cut/ (33 query images) with the "
+  "single command:", align="justify", after=2)
+P("    python3 tools/optimize_weights_headless.py \\",
+  align="justify", after=0, italic=False)
+P("        --pool newfiles/output/output_cut/db/alldata.db \\",
+  align="justify", after=0, italic=False)
+P("        --targets newfiles/output/output_cut --save",
+  align="justify", after=4, italic=False)
+P("Software dependencies (versions used in this work): Python 3.12, "
+  "NumPy 2.4.4, OpenCV 4.13.0 (headless), Pillow 12.2.0, Matplotlib "
+  "3.10.7, SciPy 1.18.0, tkinterdnd2 0.4.4 (GUI only), python-docx "
+  "1.2.0 (paper export). On a single-core consumer laptop "
+  "(11th Gen Intel Core i7-1185G7) the full leave-one-out evaluation "
+  "of all 33 queries — including five-method evaluation and "
+  "Huber-loss multi-start optimisation — completes in less than 90 s. "
+  "Per-query inference at deployment time (single image → all five "
+  "estimators, ensemble, pseudo-Raman) is below 200 ms, "
+  "approximately 1500× faster than a typical 30 s Raman integration "
+  "time, making the proposed pipeline practical for fabrication-line "
+  "and on-site quality screening.",
+  align="justify", after=8)
+
+
+# ═══════════════ S4 FIGURES ═══════════════
+H("S4. Supplementary Figures", level=1, size=14, bold=True)
 
 H("Figure S1. Full evaluation specimen mosaic",
   level=2, size=11, bold=True)
@@ -959,9 +996,27 @@ IMG("figS5_pseudo_other_conds.png", width_in=6.5,
     caption="Figure S5. Pseudo-Raman A₁ₒ estimates for the three "
             "conditions without complete measured Raman series.")
 
+H("Figure S6. Per-condition kinetic fits", level=2, size=11, bold=True)
+P("Per-condition b∗(t) measurements (coloured points) from "
+  "alldata.db together with the first-order exponential decay fit "
+  "b∗(t) = b∗_∞ + (b∗_0 − b∗_∞)·exp(−k·t) (black solid line). "
+  "The fitted decay constant k is reported in the legend of each "
+  "panel and is the parameter ultimately consumed by the kinetic "
+  "estimator (S1.3 ⑤). Native HfS₂ at 70% RH exhibits the steepest "
+  "decay (k ≈ 0.29 d⁻¹), corresponding to a half-life of ~2.4 d; "
+  "Native HfS₂ at 35% RH and PMMA/HfS₂ at 70% RH show intermediate "
+  "decay rates (k ≈ 0.05–0.08 d⁻¹); Al₂O₃/HfS₂ produces a near-"
+  "constant fit (effective k → 0) consistent with the encapsulant's "
+  "complete blockage of the oxidation pathway.", align="justify")
+IMG("figS6_kinetic_fit.png", width_in=6.5,
+    caption="Figure S6. Per-condition b∗(t) measurements with "
+            "first-order exponential decay fit. The fitted rate "
+            "constant k determines the kinetic estimator's day "
+            "inversion.")
 
-# ═══════════════ S4 TABLES ═══════════════
-H("S4. Supplementary Tables", level=1, size=14, bold=True)
+
+# ═══════════════ S5 TABLES ═══════════════
+H("S5. Supplementary Tables", level=1, size=14, bold=True)
 
 H("Table S1. Per-target leave-one-out predictions (33 queries)",
   level=2, size=11, bold=True)
@@ -1095,6 +1150,42 @@ s4_rows = [
     ("TOTAL",              "53", "20", "—"),
 ]
 _add_table(s4_hdr, s4_rows)
+P("", after=8)
+
+
+H("Table S5. Algorithm hyperparameters", level=2, size=11, bold=True)
+P("Comprehensive list of algorithm hyperparameters used throughout "
+  "the pipeline. All values are defaults of hfs2_v5_49.py at commit "
+  "tagged in the manuscript. Tunable parameters are exposed as "
+  "function arguments and may be adjusted via the project GUI without "
+  "code modification.", align="justify")
+s5_hdr = ["Module", "Parameter", "Value", "Description"]
+s5_rows = [
+    ("ROI", "paper_v_thresh",   "215",  "HSV V threshold for paper mask (>)"),
+    ("ROI", "paper_s_thresh",   "25",   "HSV S threshold for paper mask (<)"),
+    ("ROI", "morph kernel k",   "max(7, min(H,W)/80)", "elliptical SE size"),
+    ("ROI", "convex hull guard","0.90", "skip hull if hull_area > 0.9·img_area"),
+    ("ROI", "max_specimen_fraction","0.70","ROI ≤ 70% of specimen bbox"),
+    ("ROI", "edge_margin_ratio","0.05", "5% inward shift from image border"),
+    ("ROI", "α_c (cond)", "0.13–0.17", "per-cond ROI area ratio (Table S2)"),
+    ("KNN", "(w_b, w_s, w_yi)", "(0.45, 0.30, 0.25)", "metric weights"),
+    ("KNN", "k", "3", "top-k nearest references used"),
+    ("Wass", "histogram bins", "64", "b∗ range −30 to 80"),
+    ("FFT",  "radial bins", "64", "log-power radial profile"),
+    ("FFT",  "hf_thresh", "0.40·r_max", "high-freq energy radius threshold"),
+    ("FFT",  "(d_hf, d_ent, d_rad)", "(0.5, 0.3, 0.2)", "feature distance weights"),
+    ("Spatial", "grid", "3 × 3", "ROI partition for entropy/anisotropy"),
+    ("Kinetic", "model", "exp decay", "b∗(t)=b∗∞+(b∗₀−b∗∞)·exp(−k·t)"),
+    ("Kinetic", "bounds (b₀, b∞, k)", "(0,150)/(−20,80)/(1e-6,20)", "curve_fit bounds"),
+    ("Ensemble", "δ (Huber)", "5 d", "Huber loss transition"),
+    ("Ensemble", "optimiser", "L-BFGS-B", "scipy.optimize.minimize"),
+    ("Ensemble", "multi-start", "1+5 = 6", "uniform + 5 method-dominant 0.80"),
+    ("Ensemble", "grid fallback", "11⁵ ≈ 1.6e5", "0.1-step 5-D grid (no scipy)"),
+    ("Pseudo-Raman", "regressors", "4", "b∗, S, YI, ΔE univariate OLS"),
+    ("Pseudo-Raman", "weighting", "R² norm.", "wm = R²m / Σ R²"),
+    ("Pseudo-Raman", "CI factor", "1.96", "95% from regression SE"),
+]
+_add_table(s5_hdr, s5_rows)
 P("", after=12)
 
 

@@ -253,10 +253,75 @@ def figS5_pseudo_raman_other_conds():
     print("[S5] saved")
 
 
+def figS6_kinetic_fits():
+    """Cond 별 b*(t) 데이터 + exponential decay fit 곡선."""
+    sys.path.insert(0, ROOT)
+    from hfs2_v5_49 import db_load_all, roi_to_mask, compute_lab_metrics
+    pool = db_load_all(DB_ALL)
+    for im in pool:
+        if im.get("rgb") is None or im.get("roi") is None: continue
+        if im.get("mask") is None:
+            im["mask"] = roi_to_mask(im["rgb"].shape, im["roi"])
+        lab = im.get("lab", {})
+        if not lab.get("b") or np.isnan(float(lab.get("b", np.nan))):
+            im["lab"] = compute_lab_metrics(im["rgb"], im["mask"])
+
+    by_cond = defaultdict(list)
+    for im in pool:
+        try: d = float(im.get("day"))
+        except: continue
+        b = im.get("lab", {}).get("b", np.nan)
+        if b is None or np.isnan(float(b)): continue
+        by_cond[im["cond"]].append((d, float(b)))
+
+    try:
+        from scipy.optimize import curve_fit
+    except ImportError:
+        curve_fit = None
+
+    def decay(t, b0, b_inf, k):
+        return b_inf + (b0 - b_inf) * np.exp(-k * t)
+
+    fig, axes = plt.subplots(2, 2, figsize=(7.0, 4.6))
+    fig.subplots_adjust(left=0.08, right=0.99, top=0.93, bottom=0.10,
+                         wspace=0.25, hspace=0.40)
+    for i, cond in enumerate(CONDS_ORDER):
+        ax = axes[i // 2, i % 2]
+        rows = sorted(by_cond.get(cond, []), key=lambda r: r[0])
+        if not rows:
+            ax.axis("off"); continue
+        ts = np.array([r[0] for r in rows]); bs = np.array([r[1] for r in rows])
+        ax.scatter(ts, bs, s=18, color=COND_COLOR[cond], alpha=0.75,
+                   edgecolor="white", lw=0.4, label="measured b*")
+        if curve_fit and len(rows) >= 3:
+            try:
+                popt, _ = curve_fit(decay, ts, bs,
+                    p0=[bs.max(), max(-5, bs.min() - 2), 0.15],
+                    bounds=([0, -20, 1e-6], [150, 80, 20]),
+                    maxfev=8000)
+                t_grid = np.linspace(0, ts.max(), 200)
+                ax.plot(t_grid, decay(t_grid, *popt),
+                        ls="-", color="#222", lw=1.0,
+                        label=f"fit: k={popt[2]:.3f}/d")
+            except Exception as e:
+                ax.text(0.5, 0.95, f"fit failed: {e}",
+                        transform=ax.transAxes, ha="center", va="top",
+                        fontsize=6, color="#dc2626")
+        ax.set_xlabel("Aging day", fontsize=8)
+        ax.set_ylabel("b∗", fontsize=8)
+        ax.set_title(COND_SHORT[cond], fontsize=9, fontweight="bold")
+        ax.legend(fontsize=6.5, frameon=False, loc="best")
+        ax.grid(True, ls=":", lw=0.4, alpha=0.5)
+    plt.savefig(os.path.join(FIG_DIR, "figS6_kinetic_fit.png"))
+    plt.close(fig)
+    print("[S6] saved")
+
+
 if __name__ == "__main__":
     figS1_full_specimen_grid()
     figS2_roi_overlays()
     figS3_loo_scatter()
     figS4_weights_heatmap()
     figS5_pseudo_raman_other_conds()
+    figS6_kinetic_fits()
     print(f"\nAll SI figures in: {FIG_DIR}")
