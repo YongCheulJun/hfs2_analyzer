@@ -9,6 +9,18 @@ It contains the image-processing pipeline, two reference databases used in the
 paper, and the headless utilities required to reproduce the per-method and
 ensemble accuracy comparison reported in the main text.
 
+## Contents
+
+- [Quick start](#quick-start)
+- [Repository contents](#repository-contents)
+- [Database 1: `dbfiles/pkw_1.db`](#database-1-dbfilespkw_1db)
+- [Database 2: `dbfiles/raman.raman.db`](#database-2-dbfilesramaramandb)
+- [Reproducing the main-text analysis](#reproducing-the-main-text-analysis)
+- [Dependencies](#dependencies)
+- [Citation](#citation)
+- [Contact](#contact)
+- [License](#license)
+
 ---
 
 ## Quick start
@@ -22,8 +34,10 @@ pip install -r requirements.txt
 python hfs2_v5_49.py
 ```
 
-Inside the GUI, click **Load All** and select either `dbfiles/pkw_1.db` or
-`dbfiles/raman.raman.db` to populate the workspace.
+The two reference databases (`dbfiles/pkw_1.db` and `dbfiles/raman.raman.db`)
+are bundled with the repository — no separate download is required. Inside
+the GUI, click **Load All** and select either database to populate the
+workspace with the 20 image–Raman pairs used in the paper.
 
 ---
 
@@ -50,10 +64,13 @@ and Raman-calibrated A1g intensity (pseudo-Raman) estimation.
 ## Database 1: `dbfiles/pkw_1.db`
 
 SQLite database storing the 20 specimen photographs (4 passivation/humidity
-conditions × 5 aging days) with their manually-verified ROI coordinates and
+conditions × 5 aging days) together with their final ROI coordinates and
 pre-computed image descriptors. This is the "image" half of the 20
 image–Raman pairs used to anchor the Raman-calibrated A1g intensity
-estimation.
+estimation. The ROI for each specimen was first detected automatically (HSV
+mask + convex hull, condition-specific area 13–17%); a small number of
+specimens whose automatic boundary misidentified the sample were adjusted
+manually before storage.
 
 `images` table columns:
 
@@ -63,12 +80,12 @@ estimation.
 | `name` | Sample image filename (`<day>day_<RH>RH_<cond>.jpg`) |
 | `cond` | Passivation/humidity condition |
 | `day` | Aging day (0, 3, 7, 14, 28) |
-| `roi_x0`, `roi_y0`, `roi_x1`, `roi_y1` | Manually-verified ROI rectangle (image coordinates) |
+| `roi_x0`, `roi_y0`, `roi_x1`, `roi_y1` | Final ROI rectangle (image coordinates), automatic with manual review where needed |
 | `lab_L`, `lab_a`, `lab_b` | CIE Lab values (ROI pixel mean) |
-| `s_mean` | HSI saturation channel mean |
-| `yellowness_idx` | ASTM E313 Yellowness Index |
+| `s_mean` | HSI saturation channel mean (ROI pixel mean) |
+| `yellowness_idx` | ASTM E313 Yellowness Index (ROI pixel mean) |
 | `delta_e` | CIE 1976 colour difference vs. day-0 of the same condition |
-| `yellow_ratio` | Pixel ratio inside the yellow region |
+| `yellow_ratio` | Pixel ratio inside the yellow region of the ROI |
 | `glcm_con`, `glcm_eng`, `glcm_hom`, `glcm_cor` | GLCM texture descriptors |
 | `stats_json` | Auxiliary statistics in JSON form |
 | `rgb_blob`, `thumb_blob` | (optional) image blobs |
@@ -158,6 +175,37 @@ python tools/optimize_weights_headless.py \
 
 Trains the per-condition Huber-loss optimal ensemble weights and writes them
 to the project's `settings.json` so that the GUI picks them up on next start.
+
+### 4. Stand-alone leave-one-out check on the bundled databases
+
+The two bundled databases are sufficient to reproduce the per-condition
+Pearson correlations between aging day and the colour metrics — the building
+block used by every estimator in the paper:
+
+```python
+import sqlite3, statistics
+
+con = sqlite3.connect("dbfiles/pkw_1.db")
+by_cond = {}
+for cond, day, b, s, yi in con.execute(
+    "SELECT cond, day, lab_b, s_mean, yellowness_idx FROM images"
+):
+    by_cond.setdefault(cond, []).append((float(day), b, s, yi))
+con.close()
+
+def pearson(xs, ys):
+    n = len(xs); mx = sum(xs)/n; my = sum(ys)/n
+    num = sum((x - mx)*(y - my) for x, y in zip(xs, ys))
+    den = (sum((x - mx)**2 for x in xs) * sum((y - my)**2 for y in ys)) ** 0.5
+    return num/den if den else float("nan")
+
+for cond, rows in by_cond.items():
+    rows.sort()
+    days, bs, ss, yis = zip(*rows)
+    print(f"{cond:25s}  r(day, b*) = {pearson(days, bs):+.2f}  "
+          f"r(day, S) = {pearson(days, ss):+.2f}  "
+          f"r(day, YI) = {pearson(days, yis):+.2f}")
+```
 
 ---
 
