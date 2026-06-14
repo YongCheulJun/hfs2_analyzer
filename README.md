@@ -5,9 +5,11 @@ This repository accompanies the paper
 > **Raman-Calibrated Image-Based Screening of Native Oxidation Aging in CVD-Grown HfS2 Thin Films on Sapphire**
 > Yongcheul Jun and Kwangwook Park (corresponding author, kwangwook.park@jbnu.ac.kr)
 
-It contains the image-processing pipeline, two reference databases used in the
-paper, and the headless utilities required to reproduce the per-method and
-ensemble accuracy comparison reported in the main text.
+It contains the image-processing pipeline, the bundled analysis dataset
+(`dbfiles/alldata.db` + the 33 sample photographs in `dataset/images/`), and the
+headless utilities required to reproduce the four-estimator ensemble and Raman
+calibration results reported in the main text. A fresh clone reproduces every
+reported number with a single command — see [`REPRODUCE.md`](REPRODUCE.md).
 
 ## Contents
 
@@ -34,10 +36,11 @@ pip install -r requirements.txt
 python hfs2_v5_49.py
 ```
 
-The two reference databases (`dbfiles/pkw_1.db` and `dbfiles/raman.raman.db`)
-are bundled with the repository — no separate download is required. Inside
-the GUI, click **Load All** and select either database to populate the
-workspace with the 20 image–Raman pairs used in the paper.
+All data is bundled with the repository — no separate download is required:
+the 33-image analysis pool (`dbfiles/alldata.db` + `dataset/images/`), the
+20-image Raman-linked subset (`dbfiles/pkw_1.db`), and the Raman A1g
+intensities (`dbfiles/raman.raman.db`). To reproduce the paper's numbers
+without the GUI, run `python tools/reproduce_paper_4method.py`.
 
 ---
 
@@ -48,16 +51,22 @@ workspace with the 20 image–Raman pairs used in the paper.
 | `hfs2_v5_49.py` | Single-file Tkinter desktop application (~16,000 LOC) |
 | `tools/eval_roi.py` | Headless ROI accuracy evaluation |
 | `tools/optimize_weights_headless.py` | Headless ensemble-weight optimisation |
-| `tools/extract_pptx_to_db_format.py` | PPTX → image extractor utility |
-| `tools/center_crop_images.py` | Centre-crop helper |
-| `dbfiles/pkw_1.db` | Sample dataset (20 specimens) with manually-verified ROI coordinates |
+| `tools/reproduce_paper_4method.py` | Reproduces the main-text aging-day numbers (3.30 d headline) |
+| `tools/reproduce_raman_calibration.py` | Reproduces the Raman calibration metrics (R²=0.56, …) |
+| `tools/loo_no_kinetic.py`, `tools/nested_loo_eval.py` | 5- vs 4-method and leakage cross-checks |
+| `dbfiles/alldata.db` | 33-image analysis pool (descriptors + ROIs) — main reproduction data |
+| `dataset/images/` | The 33 sample photographs (PNG) |
+| `dbfiles/pkw_1.db` | 20-image Raman-linked subset with manually-verified ROI coordinates |
 | `dbfiles/raman.raman.db` | Time-resolved Raman A1g intensity for the four passivation/humidity conditions |
+| `REPRODUCE.md`, `dbfiles/CHECKSUMS.md5` | Reproduction guide and data checksums |
 | `requirements.txt` | Python dependencies |
 
 The GUI source code (`hfs2_v5_49.py`) and headless tools cover the full
 pipeline reported in the paper: ROI extraction, colour/texture descriptors,
-five descriptor-based aging-day estimators, Huber-loss ensemble weighting,
-and Raman-calibrated A1g intensity (pseudo-Raman) estimation.
+four descriptor-based aging-day estimators (kNN, Wasserstein, FFT, spatial;
+a kinetic estimator was evaluated but excluded from the final ensemble),
+Huber-loss ensemble weighting, and Raman-calibrated A1g intensity
+(pseudo-Raman) estimation.
 
 ---
 
