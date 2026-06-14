@@ -287,7 +287,7 @@ def main():
     plain_estimates = [(td, mr) for td, mr, _, _ in estimates]
     opt = optimize_advanced_weights(plain_estimates)
 
-    methods = ["knn", "wass", "fft", "spatial", "kinetic"]
+    methods = ["knn", "wass", "fft", "spatial"]   # 4-method (kinetic 제외) — 논문 정합
     print("\n=== Optimization Result ===")
     print(f"  Ground truth pairs: {len(estimates)}")
     print(f"  Baseline (uniform) RMSE: {opt['baseline_rmse']:.3f} d")
