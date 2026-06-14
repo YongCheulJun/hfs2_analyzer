@@ -145,67 +145,50 @@ con.close()
 
 ## Reproducing the main-text analysis
 
-### 1. Inspect ROIs and descriptors in the GUI
+The headline aging-day numbers are reproduced with **one command** from the
+bundled data (`dbfiles/alldata.db` + the 33 images in `dataset/images/`). The
+pipeline is deterministic, so a fresh clone yields the paper's values exactly.
+See [`REPRODUCE.md`](REPRODUCE.md) for the full number-to-command mapping and
+expected output.
+
+```bash
+export MPLBACKEND=Agg
+python tools/reproduce_paper_4method.py
+```
+
+This prints the four-estimator results for the three oxidizing conditions:
+global-weight strict leave-one-out RMSE **3.30 d** (headline), uniform 6.32 d,
+condition-specific 4.17 d, Al₂O₃ ≈ 10 d, and the per-condition kNN RMSEs
+(3.12 d / 3.56 d).
+
+### Supporting checks
+
+```bash
+python tools/loo_no_kinetic.py     # 5- vs 4-method (why the kinetic estimator is excluded)
+python tools/nested_loo_eval.py    # in-sample vs nested leave-one-out (leakage check)
+```
+
+### Ensemble-weight optimisation (global weights)
+
+```bash
+python tools/optimize_weights_headless.py \
+    --pool dbfiles/alldata.db \
+    --targets dataset/images
+```
+
+Trains the four-estimator Huber-loss optimal weights; the global weights
+concentrate on kNN (≈0.85) with a smaller spatial contribution (≈0.15),
+consistent with the paper. Add `--save` to write them to `settings.json` for
+the GUI.
+
+### Inspect ROIs and descriptors in the GUI
 
 ```bash
 python hfs2_v5_49.py
 ```
 
-In the toolbar, click **Load All** → select `dbfiles/pkw_1.db`. The 20
-specimens appear in the left panel with their stored ROI rectangles. Click
-any card to inspect the colour/texture descriptors and the Raman match (if
-any).
-
-### 2. Headless ROI accuracy check
-
-```bash
-python tools/eval_roi.py dbfiles/pkw_1.db
-```
-
-Reports per-specimen ROI quality, area ratio, and inter-condition consistency.
-
-### 3. Headless ensemble-weight optimisation
-
-```bash
-python tools/optimize_weights_headless.py \
-    --pool dbfiles/pkw_1.db \
-    --targets path/to/your/specimen/photos \
-    --save
-```
-
-Trains the per-condition Huber-loss optimal ensemble weights and writes them
-to the project's `settings.json` so that the GUI picks them up on next start.
-
-### 4. Stand-alone leave-one-out check on the bundled databases
-
-The two bundled databases are sufficient to reproduce the per-condition
-Pearson correlations between aging day and the colour metrics — the building
-block used by every estimator in the paper:
-
-```python
-import sqlite3, statistics
-
-con = sqlite3.connect("dbfiles/pkw_1.db")
-by_cond = {}
-for cond, day, b, s, yi in con.execute(
-    "SELECT cond, day, lab_b, s_mean, yellowness_idx FROM images"
-):
-    by_cond.setdefault(cond, []).append((float(day), b, s, yi))
-con.close()
-
-def pearson(xs, ys):
-    n = len(xs); mx = sum(xs)/n; my = sum(ys)/n
-    num = sum((x - mx)*(y - my) for x, y in zip(xs, ys))
-    den = (sum((x - mx)**2 for x in xs) * sum((y - my)**2 for y in ys)) ** 0.5
-    return num/den if den else float("nan")
-
-for cond, rows in by_cond.items():
-    rows.sort()
-    days, bs, ss, yis = zip(*rows)
-    print(f"{cond:25s}  r(day, b*) = {pearson(days, bs):+.2f}  "
-          f"r(day, S) = {pearson(days, ss):+.2f}  "
-          f"r(day, YI) = {pearson(days, yis):+.2f}")
-```
+In the toolbar, click **Load All** → select `dbfiles/alldata.db` to browse the
+33 specimens with their stored ROIs and descriptors.
 
 ---
 
