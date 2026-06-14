@@ -3,7 +3,7 @@
 This repository accompanies the paper
 
 > **Raman-Calibrated Image-Based Screening of Native Oxidation Aging in CVD-Grown HfS2 Thin Films on Sapphire**
-> Yongcheul Jeon and Kwangwook Park (corresponding author, kwangwook.park@jbnu.ac.kr)
+> Yongcheul Jun and Kwangwook Park (corresponding author, kwangwook.park@jbnu.ac.kr)
 
 It contains the image-processing pipeline, two reference databases used in the
 paper, and the headless utilities required to reproduce the per-method and
@@ -235,7 +235,7 @@ DOI is assigned.
 
 ## Contact
 
-- Yongcheul Jeon — junyc@mystar24.com
+- Yongcheul Jun — junyc@mystar24.com
 - Kwangwook Park (corresponding author) — kwangwook.park@jbnu.ac.kr
 
 ---
