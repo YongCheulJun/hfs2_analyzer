@@ -27,6 +27,8 @@ samples/
 *.sqlite3
 !dbfiles/pkw_1.db
 !dbfiles/raman.raman.db
+!dbfiles/alldata.db
+!dbfiles/CHECKSUMS.md5
 
 # Generic binary/document types — opt-in publishing only
 *.tif
@@ -53,3 +55,13 @@ paper/
 # OS
 .DS_Store
 Thumbs.db
+
+# Paper reproduction dataset (33 images) — published with the paper
+!dataset/
+!dataset/images/
+!dataset/images/*.png
+
+# Internal working notes / private revision tooling — not for public repo
+checklist.md
+context-notes.md
+tools/rebuild_final_docx.py
