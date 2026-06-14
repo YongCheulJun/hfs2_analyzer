@@ -1109,6 +1109,13 @@ def classify_target_stage(target_metrics: dict, stage_sigs: dict) -> dict:
             "best_dist": valid[best], "stage_sigs": stage_sigs}
 
 
+# 앙상블·가중치 최적화에 쓰는 추정기 집합 (논문 = 4-method, kinetic 제외).
+# kinetic 은 끝점 외삽 불안정으로 LOO 오차를 키워 최종 앙상블에서 배제됨(논문 §Methods).
+# 계산 자체는 GUI 정보 표시용으로 유지하되, 가중·보고 수치엔 불참한다.
+ENSEMBLE_METHODS = ("knn", "wass", "fft", "spatial")
+ALL_METHODS = ("knn", "wass", "fft", "spatial", "kinetic")  # 하위호환·표시용 전체 집합
+
+
 def adv_ensemble(knn_day: float | None, knn_conf: float,
                  wass_day: float | None, wass_conf: float,
                  fft_day: float | None,  fft_conf: float,
@@ -1133,6 +1140,8 @@ def adv_ensemble(knn_day: float | None, knn_conf: float,
                              ("fft",     fft_day,     fft_conf),
                              ("spatial", spatial_day, spatial_conf),
                              ("kinetic", kinetic_day, kinetic_conf)]:
+        if name not in ENSEMBLE_METHODS:   # 4-method: kinetic 은 앙상블에서 제외
+            continue
         if day is not None and conf >= 20.0:
             candidates.append((name, day, conf))
 
@@ -1210,11 +1219,11 @@ def optimize_advanced_weights(estimates: list,
         outlier 임계 (단위: 일). 0 또는 매우 크면 사실상 MSE.
 
     Returns:
-        {weights: {knn, wass, fft, spatial, kinetic}, rmse: float, n: int,
+        {weights: {knn, wass, fft, spatial}, rmse: float, n: int,
          baseline_rmse: float, per_method_rmse: {knn: ..., ...},
          huber_loss: float}
     """
-    methods = ["knn", "wass", "fft", "spatial", "kinetic"]
+    methods = list(ENSEMBLE_METHODS)   # 4-method (kinetic 제외) — 논문 정합
     rows = []
     truths = []
     for true_day, m_res in estimates:
@@ -1268,17 +1277,18 @@ def optimize_advanced_weights(estimates: list,
             return float(np.mean(huber))
         return float(np.mean(err * err))
 
-    best_w = np.ones(5) / 5
+    nm = len(methods)
+    best_w = np.ones(nm) / nm
     best_loss = loss(best_w)
     try:
         from scipy.optimize import minimize
-        # multi-start: 균등 + method 별 100% 시작점 5개
-        starts = [np.ones(5) / 5]
-        for j in range(5):
-            s = np.full(5, 0.05); s[j] = 0.80
+        # multi-start: 균등 + method 별 100% 시작점 (난수 없는 고정 시작점)
+        starts = [np.ones(nm) / nm]
+        for j in range(nm):
+            s = np.full(nm, 0.05); s[j] = 0.80
             starts.append(s)
         for x0 in starts:
-            res = minimize(loss, x0, bounds=[(0, 1)] * 5,
+            res = minimize(loss, x0, bounds=[(0, 1)] * nm,
                            method="L-BFGS-B")
             if res.fun < best_loss:
                 best_loss = float(res.fun)
@@ -1288,24 +1298,18 @@ def optimize_advanced_weights(estimates: list,
             best_w = best_w / s
     except Exception as e:
         print(f"[optimize_advanced_weights] scipy unavailable ({e}); grid search")
-        # 단순 grid 0.1 단위 — 11^5 = 161051 점
-        best_w = np.ones(5) / 5
+        # 단순 simplex grid 0.1 단위 (method 수 무관)
+        best_w = np.ones(nm) / nm
         best_loss = loss(best_w)
         steps = np.linspace(0.0, 1.0, 11)
-        for w0 in steps:
-            for w1 in steps:
-                if w0 + w1 > 1: break
-                for w2 in steps:
-                    if w0 + w1 + w2 > 1: break
-                    for w3 in steps:
-                        if w0 + w1 + w2 + w3 > 1: break
-                        w4 = 1 - (w0 + w1 + w2 + w3)
-                        if w4 < 0: continue
-                        cand = np.array([w0, w1, w2, w3, w4])
-                        v = loss(cand)
-                        if v < best_loss:
-                            best_loss = v
-                            best_w = cand
+        from itertools import product
+        for combo in product(steps, repeat=nm - 1):
+            if sum(combo) > 1: continue
+            cand = np.array(list(combo) + [1.0 - sum(combo)])
+            v = loss(cand)
+            if v < best_loss:
+                best_loss = v
+                best_w = cand
 
     # RMSE 는 best_w 에 대한 정확한 RMSE (Huber loss 와 별개)
     pred = A @ best_w
@@ -5128,7 +5132,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 "<strong>연산:</strong> dist = 0.4·|Δ엔트로피| + 0.4·|Δ경계기울기| + 0.2·|Δ이방성|<br>"
                 "confidence = max(0, 100 - dist_min × 400)</p>"
 
-                "<h4>⑤ Kinetic Model — 지수 감쇠 물리 모델</h4>"
+                "<h4>⑤ Kinetic Model — 지수 감쇠 물리 모델 (앙상블 제외·참고용)</h4>"
                 "<p><strong>개념:</strong> 산화는 물리화학적 반응 법칙을 따릅니다. "
                 "참조 DB에서 조건별로 b*(t) = b*∞ + (b*₀ - b*∞)·exp(-k·t) 모델을 피팅하고, "
                 "대상 이미지의 b* 값을 역대입하여 t(날짜)를 역산한다. "
@@ -5194,7 +5198,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 "<strong>Computation:</strong> dist = 0.4·|Δentropy| + 0.4·|Δboundary_grad| + 0.2·|Δanisotropy|<br>"
                 "confidence = max(0, 100 - dist_min × 400)</p>"
 
-                "<h4>⑤ Kinetic Model — Exponential Decay Physical Model</h4>"
+                "<h4>⑤ Kinetic Model — Exponential Decay Physical Model (excluded from ensemble, reference only)</h4>"
                 "<p><strong>Concept:</strong> Oxidation follows physical chemistry laws. "
                 "The model b*(t) = b*∞ + (b*₀ - b*∞)·exp(-k·t) is fitted from the reference DB, "
                 "and the target b* is back-calculated to estimate t (day). "
@@ -5207,7 +5211,8 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 "Step 4: confidence = R² × 100 × stability (higher when ratio is in 0-1 range)</p>"
 
                 "<h3>9.3 Ensemble Integration</h3>"
-                "<p>Integrates estimates from up to 5 methods.<br>"
+                "<p>Integrates estimates from 4 methods (KNN/Wasserstein/FFT/Spatial). "
+                "The Kinetic Model is shown for reference but excluded from the ensemble.<br>"
                 "Step 1: Exclude methods with confidence < 20%<br>"
                 "Step 2: weight_i = confidence_i / Σ(confidence_i)<br>"
                 "Step 3: ensemble_day = Σ(est_day_i × weight_i)<br>"
@@ -5221,7 +5226,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             ("wass",    "② Wasserstein (b* EMD)",       "🟢"),
             ("fft",     "③ FFT Texture",                "🟡"),
             ("spatial", "④ Spatial Pattern",            "🟠"),
-            ("kinetic", "⑤ Kinetic Model",              "🟣"),
+            ("kinetic", "⑤ Kinetic Model (excluded)",   "🟣"),
             ("ens",     "⑥ Ensemble",                   "🔴"),
         ]
         rows_html = ""
@@ -5705,7 +5710,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
                 ("wass",    "Wasserstein EMD"),
                 ("fft",     "FFT Texture"),
                 ("spatial", "Spatial Pattern"),
-                ("kinetic", "Kinetic Model"),
+                ("kinetic", "Kinetic Model (excluded)"),
                 ("ens",     "Ensemble"),
             ]
             hdr_row = (["방법(Method)", "추정일(Day)", "가중치(Weight)"]
@@ -7725,7 +7730,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             "cond_input":     cond_input,
         }
 
-        # Advanced 분석 추가 — 5 methods + ensemble (saved weights 적용)
+        # Advanced 분석 추가 — 4-method ensemble (kinetic 은 참고용 계산만, 앙상블 제외)
         if with_advanced:
             try:
                 adv_res = self._compute_advanced_for_target(
@@ -9423,7 +9428,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             ("wass",    "🟢 Wasserstein",       "#22c55e"),
             ("fft",     "🟡 FFT Texture",       "#fbbf24"),
             ("spatial", "🟠 Spatial Pattern",   "#f97316"),
-            ("kinetic", "🟣 Kinetic Model",     "#a78bfa"),
+            ("kinetic", "🟣 Kinetic Model (제외)", "#a78bfa"),
             ("ens",     "🔴 Ensemble",          "#ef4444"),
         ]
         for key, label, color in methods:
@@ -9734,7 +9739,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
             settings["adv_weights"] = opt["weights"]
         save_settings(settings)
 
-        methods = ["knn", "wass", "fft", "spatial", "kinetic"]
+        methods = list(ENSEMBLE_METHODS)   # 4-method 가중치 표시
         improve_pct = 0.0
         if opt["baseline_rmse"] > 0:
             improve_pct = (opt["baseline_rmse"] - opt["rmse"]) \
@@ -9798,7 +9803,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
     def _adv_run(self):
         """▶ Run Advanced Estimation 버튼 핸들러.
 
-        모든 평가대상에 대해 _pred_compute_one (5 methods + ensemble)
+        모든 평가대상에 대해 _pred_compute_one (4-method ensemble + kinetic 참고용)
         실행 후 Treeview 에 결과 표시. 첫 행 자동 선택 → detail 패널.
         """
         if not getattr(self, "_pred_targets", None):
@@ -9987,7 +9992,7 @@ pre{background:#1e1e2e;color:#cdd6f4;padding:18px 22px;border-radius:6px;
         cv.draw()
 
     def _adv_show_for_target(self, t: dict):
-        """선택된 평가대상의 5 methods + ensemble + 가중치 + 해석 표시."""
+        """선택된 평가대상의 4-method ensemble + kinetic(참고용) + 가중치 + 해석 표시."""
         res = t.get("result") or {}
         adv = res.get("adv")
 
